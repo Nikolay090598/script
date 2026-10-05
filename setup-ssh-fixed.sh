@@ -4,7 +4,7 @@ umask 077
 trap 'echo -e "\033[0;31mОшибка на строке ${LINENO}: ${BASH_COMMAND}\033[0m" >&2' ERR
 
 #==============================================================================
-# VPS Setup v4.4.1 - VPN Foundation + SSH Honeypot + Swap + Limits
+# VPS Setup v4.4.2 - VPN Foundation + SSH Honeypot + Swap + Limits
 #
 # Run from Gist Raw URL (interactive-safe):
 #   curl -fsSL "RAW_URL" | sudo bash
@@ -12,7 +12,7 @@ trap 'echo -e "\033[0;31mОшибка на строке ${LINENO}: ${BASH_COMMAN
 
 G='\033[0;32m'; R='\033[0;31m'; Y='\033[1;33m'; NC='\033[0m'
 
-echo -e "${G}VPS Setup v4.4.1 - VPN Foundation + безопасная настройка SSH${NC}"
+echo -e "${G}VPS Setup v4.4.2 - VPN Foundation + безопасная настройка SSH${NC}"
 
 if [[ ${EUID} -ne 0 ]]; then
   echo -e "${R}Запускайте с root!${NC}"
@@ -478,16 +478,16 @@ for tag in ('SSH_HONEYPOT_TRAP', 'VPS_PORT22_TRAP'):
 if mode == 'add':
     a = s.index('*filter\n')
     b = s.index('\nCOMMIT', a)
-    rule = re.search(r'^-A ufw-before-input\b', s[a:b], re.M)
+    rule = re.search(r'^-A (ufw6?-before-input)\b', s[a:b], re.M)
     if not rule:
-        raise SystemExit('Не найдена цепочка ufw-before-input: ' + filename)
+        raise SystemExit('Не найдена входящая цепочка UFW: ' + filename)
     pos = a + rule.start()
     block = '''# ===== VPS_PORT22_TRAP_START =====
 -A ufw-before-input -p tcp --dport 22 --tcp-flags SYN,RST,ACK SYN -m conntrack --ctstate NEW -j LOG --log-prefix "VPS_PORT22_TRAP: "
 -A ufw-before-input -p tcp --dport 22 -j DROP
 # ===== VPS_PORT22_TRAP_END =====
 '''
-    s = s[:pos] + block + s[pos:]
+    s = s[:pos] + block.replace("ufw-before-input", rule.group(1)) + s[pos:]
 elif mode != 'remove':
     raise SystemExit('Неизвестная операция')
 st = p.stat()
