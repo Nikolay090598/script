@@ -4,7 +4,7 @@ umask 077
 trap 'echo -e "\033[0;31mОшибка на строке ${LINENO}: ${BASH_COMMAND}\033[0m" >&2' ERR
 
 #==============================================================================
-# VPS Setup v4.4.0 - VPN Foundation + SSH Honeypot + Swap + Limits
+# VPS Setup v4.4.1 - VPN Foundation + SSH Honeypot + Swap + Limits
 #
 # Run from Gist Raw URL (interactive-safe):
 #   curl -fsSL "RAW_URL" | sudo bash
@@ -12,7 +12,7 @@ trap 'echo -e "\033[0;31mОшибка на строке ${LINENO}: ${BASH_COMMAN
 
 G='\033[0;32m'; R='\033[0;31m'; Y='\033[1;33m'; NC='\033[0m'
 
-echo -e "${G}VPS Setup v4.4.0 - VPN Foundation + безопасная настройка SSH${NC}"
+echo -e "${G}VPS Setup v4.4.1 - VPN Foundation + безопасная настройка SSH${NC}"
 
 if [[ ${EUID} -ne 0 ]]; then
   echo -e "${R}Запускайте с root!${NC}"
@@ -639,7 +639,7 @@ backend = systemd
 bantime = 3600
 findtime = 600
 maxretry = 5
-ignoreip = %(known/ignoreip)s $IGN
+ignoreip = $IGN
 
 # Переопределяем старый jail, пока порт 22 используется как запасной SSH.
 [port22-trap]
@@ -652,7 +652,7 @@ maxretry = 3
 findtime = 60
 bantime = -1
 bantime.increment = false
-ignoreip = %(known/ignoreip)s $IGN
+ignoreip = $IGN
 usedns = no
 action = vps-port22-permanent
 EOF
