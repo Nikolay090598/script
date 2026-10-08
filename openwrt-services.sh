@@ -1,5 +1,5 @@
 #!/bin/sh
-# OpenWrt Services Menu 1.4 - BusyBox ash, apk/opkg, native Docker images.
+# OpenWrt Services Menu 1.5 - BusyBox ash, apk/opkg, native Docker images.
 umask 077
 CFG=owrt_services
 OWNER=owrt-services-v1
@@ -11,18 +11,123 @@ exists() { docker inspect "$1" >/dev/null 2>&1; }
 owned() { [ "$(docker inspect -f '{{index .Config.Labels "owrt.services"}}' "$1" 2>/dev/null)" = "$OWNER" ]; }
 running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; }
 ready() { docker info >/dev/null 2>&1 || { say 'Сначала установите/запустите Docker (пункт 1).'; return 1; }; }
-root_dir() { ROOT=$(get main.root); [ -n "$ROOT" ] && [ -f "$ROOT/.owrt-services" ] || { say 'Не найден диск с данными. Подключите его или выберите хранилище.'; return 1; }; }
+root_dir() { ROOT=$(get main.root); [ -n "$ROOT" ] && [ -f "$ROOT/.owrt-services" ] || { say 'Не найден диск с данными. Подключите его или выберите хранилище.'; return 1; }; check_data_storage "$ROOT"; }
+fs_type() { df -T "$1" 2>/dev/null | awk 'NR>1 {fs=$2} END {print fs}'; }
+valid_storage_path() {
+    case "$1" in /*) ;; *) say 'Нужен абсолютный путь.'; return 1;; esac
+    case "$1" in /|/tmp|/tmp/*|/var|/var/*|/dev|/dev/*|/proc|/proc/*|/sys|/sys/*|*[!A-Za-z0-9_./-]*|*/../*|*/..) say 'Недопустимый или временный путь.'; return 1;; esac
+}
+check_data_storage() (
+    path=$1
+    [ -d "$path" ] || { say "Каталог $path недоступен."; exit 1; }
+    fs=$(fs_type "$path")
+    case "$fs" in ext2|ext3|ext4|f2fs|btrfs|xfs|overlay) ;; *) say "Файловая система '$fs' для данных сервисов не поддерживается этим меню."; exit 1;; esac
+)
+probe_overlay_storage() (
+    path=$1
+    probe=$(mktemp -d "$path/.ows-overlay-test.XXXXXX") || exit 1
+    mounted=0
+    # shellcheck disable=SC2329 # Invoked by the EXIT trap.
+    cleanup() {
+        rc=$?
+        if [ "$mounted" = 1 ] && ! umount "$probe/merged"; then
+            say "Не удалось отключить тестовое монтирование $probe/merged; каталог оставлен для проверки."; exit 1
+        fi
+        rm -rf "$probe"
+        exit "$rc"
+    }
+    trap cleanup EXIT
+    trap 'exit 130' HUP INT TERM
+    mkdir "$probe/lower" "$probe/upper" "$probe/work" "$probe/merged" || exit 1
+    printf 'before\n' > "$probe/lower/check" || exit 1
+    mount -t overlay overlay -o "lowerdir=$probe/lower,upperdir=$probe/upper,workdir=$probe/work,index=off" "$probe/merged" || { say "OverlayFS не поддерживается в $path. Хранилище Docker не изменено."; exit 1; }
+    mounted=1
+    if ! [ "$(cat "$probe/merged/check")" = before ] || ! printf 'after\n' > "$probe/merged/check" || ! rm "$probe/merged/check"; then
+        say 'Не прошла проверка чтения, copy-up или whiteout.'; exit 1
+    fi
+)
+check_engine_storage() (
+    path=$1; driver=${2:-overlayfs}
+    check_data_storage "$path" || exit 1
+    fs=$(fs_type "$path")
+    case "$driver" in overlayfs|overlay2)
+        if [ "$fs" = overlay ]; then
+            say "Docker Root Dir $path находится на overlay: вложенное хранилище слоёв здесь не используется. Выберите прямой путь на F2FS/ext4, например /overlay/docker-engine (пункт 12)."; exit 1
+        fi
+        probe_overlay_storage "$path" || exit 1;;
+        vfs) say 'Docker использует VFS: он работает без OverlayFS, но занимает больше места.';;
+        *) say "Текущий драйвер $driver сохранён; проверка OverlayFS к нему не применяется.";;
+    esac
+)
+engine_ready() {
+    ready || return 1
+    engine_path=$(docker info --format '{{.DockerRootDir}}') || return 1
+    engine_driver=$(docker info --format '{{.Driver}}') || return 1
+    check_engine_storage "$engine_path" "$engine_driver"
+}
+engine_default_path() {
+    if [ "$(fs_type "$ROOT")" = overlay ]; then say /overlay/docker-engine
+    else say "$ROOT/docker"; fi
+}
+configure_engine_storage() (
+    ready && root_dir || exit 1
+    current=$(docker info --format '{{.DockerRootDir}}') || exit 1
+    driver=$(docker info --format '{{.Driver}}') || exit 1
+    candidate=$(engine_default_path)
+    say "Данные сервисов: $ROOT ($(fs_type "$ROOT")); Docker: $current ($(fs_type "$current")), драйвер $driver."
+    say 'Изменение Docker Root Dir не переносит папку данных сервисов. Старое хранилище остаётся на месте; образы в новом пустом хранилище скачиваются заново.'
+    ask "Новый Docker Root Dir [$candidate]: "; candidate=${ANSWER:-$candidate}
+    valid_storage_path "$candidate" || exit 1
+    mkdir -p "$candidate" || exit 1
+    candidate=$(cd "$candidate" && pwd -P) || exit 1
+    valid_storage_path "$candidate" || exit 1
+    if [ "$candidate" = "$(cd "$current" && pwd -P)" ]; then
+        check_engine_storage "$candidate" "$driver" || exit 1
+        say 'Текущий путь уже подходит. Настройки не менялись.'; exit 0
+    fi
+    # Even stopped containers and unattached named volumes must not disappear.
+    containers=$(docker ps -aq) || exit 1
+    volumes=$(docker volume ls -q) || exit 1
+    [ -z "$containers" ] && [ -z "$volumes" ] || { say 'В Docker есть контейнеры или тома. Автоматическая смена хранилища запрещена; требуется перенос с сохранением данных.'; exit 1; }
+    [ -z "$(ls -A "$candidate")" ] || { say 'Новый каталог не пуст. Для автоматической настройки выберите пустой каталог.'; exit 1; }
+    [ -z "$(uci -q get dockerd.globals.alt_config_file)" ] || { say 'Docker использует alt_config_file. Меню не изменяет стороннюю конфигурацию daemon.'; exit 1; }
+    [ -z "$(uci changes dockerd)" ] || { say 'Есть несохранённые изменения dockerd. Сохраните или отмените их сначала.'; exit 1; }
+    check_engine_storage "$candidate" "$driver" || exit 1
+    ask 'Применить новый путь и перезапустить Docker? [y/N]: '; case "$ANSWER" in y|Y) ;; *) exit 0;; esac
+    backup="/root/dockerd-before-storage-$(date +%Y%m%d-%H%M%S)-$$.conf"
+    cp -p /etc/config/dockerd "$backup" || exit 1
+    /etc/init.d/dockerd stop || exit 1
+    if ! uci set "dockerd.globals.data_root=$candidate" || ! uci commit dockerd || ! /etc/init.d/dockerd start; then
+        cp -p "$backup" /etc/config/dockerd; uci -q revert dockerd; /etc/init.d/dockerd start
+        say "Не удалось применить путь; прежняя конфигурация восстановлена. Копия: $backup"; exit 1
+    fi
+    n=0
+    until docker info >/dev/null 2>&1; do n=$((n+1)); [ "$n" -lt 20 ] || break; sleep 1; done
+    actual=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+    if [ "$actual" != "$candidate" ] && [ "$actual" != "$candidate/" ]; then
+        /etc/init.d/dockerd stop; cp -p "$backup" /etc/config/dockerd; uci -q revert dockerd; /etc/init.d/dockerd start
+        say "Docker не подтвердил новый путь. Прежняя конфигурация восстановлена; копия $backup."; exit 1
+    fi
+    say "Docker Root Dir: $actual. Настройка сохранена. Данные сервисов остаются в $ROOT."
+)
+storage_menu() (
+    root_dir || exit 1
+    say "Данные сервисов: $ROOT ($(fs_type "$ROOT"))"
+    say '1 Проверить хранилище Docker  2 Настроить другой Docker Root Dir'
+    ask 'Действие: '
+    case "$ANSWER" in 1) engine_ready && say 'Проверка хранилища Docker пройдена.';; 2) configure_engine_storage;; *) exit 1;; esac
+)
+
 choose_storage() (
     [ -z "$(get main.root)" ] || { say "Хранилище уже выбрано: $(get main.root). Перенос существующих данных вручную."; exit 0; }
     df -h
-    say 'Выберите постоянный каталог на ext4/btrfs. Рекомендуется диск от 8 ГБ.'
+    say 'Выберите постоянный каталог данных сервисов. F2FS/ext4 и корень OpenWrt overlay допустимы; хранилище слоёв Docker проверяется отдельно.'
     ask 'Каталог [/root/owrt-services]: '; d=${ANSWER:-/root/owrt-services}
     case "$d" in /*) ;; *) say 'Нужен абсолютный путь.'; exit 1;; esac
     case "$d" in /|/tmp|/tmp/*|/var|/var/*|/dev/*|/proc/*|/sys/*|*[!A-Za-z0-9_./-]*|*/../*|*/..) say 'Недопустимый или временный путь.'; exit 1;; esac
     mkdir -p "$d" || exit 1
     d=$(cd "$d" && pwd -P) || exit 1
-    fs=$(df -T "$d" | awk 'END {print $2}')
-    case "$fs" in tmpfs|ramfs|vfat|exfat|ntfs|fuseblk) say "Файловая система $fs не подходит для Docker."; exit 1;; esac
+    check_data_storage "$d" || exit 1
     kb=$(df -Pk "$d" | awk 'END {print $4}')
     [ "$kb" -ge 2097152 ] || { say 'Нужно минимум 2 ГБ свободного места; для всех серверов лучше 8 ГБ и больше.'; exit 1; }
     mkdir -p "$d/data" "$d/config" "$d/backups" || exit 1
@@ -42,8 +147,9 @@ install_docker() (
         if [ -n "$existing" ] && [ -d "$existing" ] && [ -n "$(ls -A "$existing" 2>/dev/null)" ]; then
             say "Сохраняю существующее Docker-хранилище: $existing"
         else
-            mkdir -p "$ROOT/docker" || exit 1
-            uci set dockerd.globals=globals && uci set "dockerd.globals.data_root=$ROOT/docker" && uci commit dockerd || exit 1
+            candidate=$(engine_default_path)
+            mkdir -p "$candidate" && check_engine_storage "$candidate" || exit 1
+            uci set dockerd.globals=globals && uci set "dockerd.globals.data_root=$candidate" && uci commit dockerd || exit 1
         fi
         /etc/init.d/dockerd enable && /etc/init.d/dockerd start || exit 1
     else /etc/init.d/dockerd enable || exit 1; fi
@@ -51,7 +157,11 @@ install_docker() (
     until docker info >/dev/null 2>&1; do
         n=$((n+1)); [ "$n" -lt 20 ] || { say 'Docker не запустился: logread -e dockerd'; exit 1; }; sleep 1
     done
-    say 'Docker готов. Каталог образов:'
+    if ! engine_ready; then
+        ask 'Выбрать подходящий Docker Root Dir? [y/N]: '
+        case "$ANSWER" in y|Y) configure_engine_storage && engine_ready || exit 1;; *) exit 1;; esac
+    fi
+    say 'Docker готов. Каталог образов:' 
     docker info --format '{{.DockerRootDir}}'
     say 'Если данные на внешнем диске, настройте его автоматическое монтирование до запуска Docker.'
 )
@@ -151,7 +261,7 @@ backup_data() (
 )
 # Early launch rollback restores containers, not database migrations. The data backup stays available.
 deploy() (
-    ready && root_dir && prepare_config && check_names || exit 1
+    engine_ready && root_dir && prepare_config && check_names || exit 1
     IMAGE=$(get "$S.image")
     say "Загрузка $IMAGE для $(uname -m)…"
     docker pull "$IMAGE" || { say 'Образ недоступен для вашей архитектуры либо есть ошибка сети/места. Старые контейнеры сохранены.'; exit 1; }
@@ -172,7 +282,9 @@ deploy() (
         for c in $new; do docker rm -f "$c" >/dev/null 2>&1; done
         for c in $old; do docker rename "$c-previous" "$c"; done
         for c in $was_running; do docker start "$c" >/dev/null; done
-        say 'Возвращены прежние контейнеры. Если новая версия изменила БД, восстановите данные из резервной копии.'
+        if [ -n "$old" ]; then
+            say 'Возвращены прежние контейнеры. Если новая версия изменила БД, восстановите данные из резервной копии.'
+        else say 'Установка не завершена. Данные сервисов сохранены.'; fi
     }
     trap 'rollback; exit 130' HUP INT TERM
     for c in $(names); do
@@ -368,7 +480,7 @@ main() {
     touch /etc/config/owrt_services
     [ "$(get main)" = settings ] || put main settings
     while :; do
-        say ''; say "OpenWrt Services 1.4 | $(uname -m) | $(get main.root)"
+        say ''; say "OpenWrt Services 1.5 | $(uname -m) | $(get main.root)"
         say '1 Установить/запустить Docker'
         say '2 Установить или обновить TorrServer'
         say '3 Установить или обновить TeamSpeak'
@@ -380,13 +492,14 @@ main() {
         say '9 Резервная копия данных сервера'
         say '10 Расширение диска отключено'
         say '11 TS6: внешний IP локального клиента (SNAT)'
+        say '12 Проверка / настройка хранилища Docker'
         say '0 Выход'
         ask 'Выбор: ' || break
         case "$ANSWER" in
             1) install_docker;;
             2) S=torrserver; deploy;; 3) S=teamspeak; deploy;; 4) S=mumble; deploy;; 5) S=rustdesk; deploy;;
             6) if ready; then docker ps -a --filter "label=owrt.services=$OWNER" --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'; docker system df; fi; df -h;;
-            7) select_service && manage;; 8) select_service && firewall_menu;; 9) select_service && backup_data;; 10) say 'Расширение диска удалено из версии 1.2. Автоматические изменения разделов и файловой системы не выполняются.';; 11) snat_menu;; 0) break;; *) say 'Неизвестный пункт.';;
+            7) select_service && manage;; 8) select_service && firewall_menu;; 9) select_service && backup_data;; 10) say 'Расширение диска удалено из версии 1.2. Автоматические изменения разделов и файловой системы не выполняются.';; 11) snat_menu;; 12) storage_menu;; 0) break;; *) say 'Неизвестный пункт.';;
         esac
     done
 }
