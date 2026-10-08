@@ -1,5 +1,5 @@
 #!/bin/sh
-# OpenWrt Services Menu 1.2 - BusyBox ash, apk/opkg, native Docker images.
+# OpenWrt Services Menu 1.4 - BusyBox ash, apk/opkg, native Docker images.
 umask 077
 CFG=owrt_services
 OWNER=owrt-services-v1
@@ -103,12 +103,24 @@ prepare_config() (
     esac
     put "$S.image" "$image"
 )
+prepare_teamspeak_permissions() (
+    data="$ROOT/data/teamspeak"
+    [ -d "$data" ] && [ ! -L "$data" ] || { say 'Каталог данных TeamSpeak отсутствует или является символической ссылкой.'; exit 1; }
+    ids=$(docker run --rm --network none --entrypoint /bin/sh "$IMAGE" -c 'id -u; id -g') || { say 'Не удалось определить UID/GID пользователя образа TeamSpeak.'; exit 1; }
+    uid=$(printf '%s\n' "$ids" | sed -n '1p'); gid=$(printf '%s\n' "$ids" | sed -n '2p')
+    case "$uid" in ''|*[!0-9]*) say 'Некорректный UID образа.'; exit 1;; esac
+    case "$gid" in ''|*[!0-9]*) say 'Некорректный GID образа.'; exit 1;; esac
+    say "Настройка владельца только каталога TeamSpeak: $uid:$gid"
+    chown -hR "$uid:$gid" "$data" && chmod -R u+rwX "$data" && chmod 700 "$data" || exit 1
+)
+
 create_container() (
     name=$1
     set -- docker run -d --name "$name" --label "owrt.services=$OWNER" --network host --restart unless-stopped --log-driver json-file --log-opt max-size=5m --log-opt max-file=2
     case "$name" in
         ows-torrserver) set -- "$@" -v "$ROOT/data/torrserver:/opt/ts" "$IMAGE";;
         ows-teamspeak)
+            prepare_teamspeak_permissions || exit 1
             if [ "$(get teamspeak.version)" = 3 ]; then target=/var/ts3server; else target=/var/tsserver; fi
             set -- "$@" --env-file "$ROOT/config/teamspeak.env" -v "$ROOT/data/teamspeak:$target" "$IMAGE";;
         ows-mumble) set -- "$@" --env-file "$ROOT/config/mumble.env" -v "$ROOT/data/mumble:/data" "$IMAGE";;
@@ -174,9 +186,15 @@ deploy() (
         new="$new $c"
         create_container "$c" || { rollback; exit 1; }
     done
-    sleep 5
-    for c in $new; do
-        if ! running "$c"; then docker logs --tail 30 "$c"; rollback; exit 1; fi
+    n=0
+    while [ "$n" -lt 3 ]; do
+        sleep 5
+        for c in $new; do
+            if ! running "$c" || [ "$(docker inspect -f '{{.RestartCount}}' "$c")" != 0 ]; then
+                docker logs --tail 30 "$c"; rollback; exit 1
+            fi
+        done
+        n=$((n+1))
     done
     for c in $old; do docker rm "$c-previous" >/dev/null || exit 1; done
     trap - HUP INT TERM
@@ -228,6 +246,118 @@ firewall_menu() (
         fw_done=1; say 'Правила применены. Это вход на сам роутер, не DNAT. Проверяйте с внешней сети.'
     else exit 1; fi
 )
+install_snat_hooks() (
+    for path in /usr/libexec/ows-ts6-snat /etc/init.d/ows-ts6-snat /etc/hotplug.d/iface/95-ows-ts6-snat; do
+        if [ -e "$path" ] && ! grep -q 'Managed by OpenWrt Services: TS6 local SNAT' "$path"; then
+            say "Файл $path уже существует и не принадлежит меню."; exit 1
+        fi
+    done
+    mkdir -p /usr/libexec /etc/hotplug.d/iface || exit 1
+    tmp=$(mktemp -d /tmp/ows-snat-install.XXXXXX) || exit 1
+    trap 'rm -rf "$tmp"' EXIT
+    cat > "$tmp/helper" <<'OWS_SNAT_HELPER'
+#!/bin/sh
+# Managed by OpenWrt Services: TS6 local SNAT
+umask 077
+TABLE=ts6_local_snat
+fail() { logger -t ows-ts6-snat "$*"; printf '%s\n' "$*" >&2; exit 1; }
+ipv4() { printf '%s\n' "$1" | awk -F. 'NF != 4 {exit 1} {for(i=1;i<=4;i++) if($i !~ /^[0-9]+$/ || $i>255 || length($i)>3) exit 1}'; }
+command -v nft >/dev/null 2>&1 || exit 1
+mkdir -p /var/lock
+mkdir /var/lock/ows-ts6-snat.lock 2>/dev/null || exit 0
+batch=''
+trap 'rm -f "$batch"; rmdir /var/lock/ows-ts6-snat.lock 2>/dev/null' EXIT
+trap 'exit 130' HUP INT TERM
+present=0; nft list table ip "$TABLE" >/dev/null 2>&1 && present=1
+if [ "${1:-apply}" = clear ] || [ "$(uci -q get owrt_services.teamspeak.snat_enabled)" != 1 ]; then
+    [ "$present" = 0 ] || nft delete table ip "$TABLE"
+    exit $?
+fi
+client=$(uci -q get owrt_services.teamspeak.snat_client)
+iface=$(uci -q get owrt_services.teamspeak.snat_wan)
+ipv4 "$client" || fail 'Неверный IPv4 клиента для TS6 SNAT.'
+case "$iface" in ''|*[!A-Za-z0-9_-]*) fail 'Неверное имя интерфейса WAN.';; esac
+status=$(ubus call "network.interface.$iface" status 2>/dev/null) || status=''
+wan=$(printf '%s\n' "$status" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)
+up=$(printf '%s\n' "$status" | jsonfilter -e '@.up' 2>/dev/null)
+if [ "$up" != true ] || [ -z "$wan" ]; then
+    [ "$present" = 0 ] || nft delete table ip "$TABLE" || exit 1
+    logger -t ows-ts6-snat "Нет IPv4 у $iface; правило будет установлено при поднятии интерфейса."
+    exit 0
+fi
+ipv4 "$wan" || fail 'Неверный IPv4 интерфейса WAN.'
+batch=$(mktemp /tmp/ows-ts6-snat.XXXXXX) || exit 1
+{
+    [ "$present" = 0 ] || printf 'delete table ip %s\n' "$TABLE"
+    cat <<EOF
+table ip $TABLE {
+    chain input {
+        type nat hook input priority srcnat; policy accept;
+        ip saddr $client ip daddr $wan udp dport 9987 counter snat to $wan
+    }
+}
+EOF
+} > "$batch"
+# One atomic transaction; invalid rules do not remove the working table.
+if ! nft -c -f "$batch" || ! nft -f "$batch"; then fail 'Не удалось применить TS6 SNAT; прежние правила не удалены.'; fi
+logger -t ows-ts6-snat "TS6 SNAT: $client -> $wan, UDP 9987."
+OWS_SNAT_HELPER
+    cat > "$tmp/init" <<'OWS_SNAT_INIT'
+#!/bin/sh /etc/rc.common
+# Managed by OpenWrt Services: TS6 local SNAT
+START=99
+STOP=10
+start() { /usr/libexec/ows-ts6-snat; }
+reload() { /usr/libexec/ows-ts6-snat; }
+stop() { /usr/libexec/ows-ts6-snat clear; }
+OWS_SNAT_INIT
+    cat > "$tmp/hotplug" <<'OWS_SNAT_HOTPLUG'
+#!/bin/sh
+# Managed by OpenWrt Services: TS6 local SNAT
+case "$ACTION" in ifup|ifupdate|ifdown)
+    if [ "$INTERFACE" = "$(uci -q get owrt_services.teamspeak.snat_wan)" ]; then
+        /usr/libexec/ows-ts6-snat
+    fi;;
+esac
+OWS_SNAT_HOTPLUG
+    chmod 700 "$tmp/helper" "$tmp/init" "$tmp/hotplug" || exit 1
+    mv "$tmp/helper" /usr/libexec/ows-ts6-snat && mv "$tmp/init" /etc/init.d/ows-ts6-snat && mv "$tmp/hotplug" /etc/hotplug.d/iface/95-ows-ts6-snat
+)
+snat_menu() (
+    if ! command -v nft >/dev/null 2>&1 || ! command -v fw4 >/dev/null 2>&1; then say 'Этот пункт требует OpenWrt с firewall4/nftables.'; exit 1; fi
+    say "TS6 SNAT: enabled=$(get teamspeak.snat_enabled); клиент=$(get teamspeak.snat_client); WAN=$(get teamspeak.snat_wan)"
+    say '1 Включить / изменить  2 Отключить  3 Статус / счётчики'
+    ask 'Действие: '; action=$ANSWER
+    case "$action" in
+        3) nft list table ip ts6_local_snat; exit $?;;
+        2) put teamspeak.snat_enabled 0 || exit 1
+            if [ -x /usr/libexec/ows-ts6-snat ]; then /usr/libexec/ows-ts6-snat clear || exit 1
+            elif nft list table ip ts6_local_snat >/dev/null 2>&1; then nft delete table ip ts6_local_snat || exit 1; fi
+            [ ! -x /etc/init.d/ows-ts6-snat ] || /etc/init.d/ows-ts6-snat disable
+            say 'SNAT отключён. Переподключите клиент TeamSpeak.'; exit 0;;
+        1) ;; *) exit 1;;
+    esac
+    [ -z "$(uci changes firewall)" ] || { say 'Сначала сохраните или отмените изменения firewall в LuCI.'; exit 1; }
+    if uci -q get firewall.ows_ts6_snat >/dev/null && [ "$(uci -q get firewall.ows_ts6_snat.path)" != /usr/libexec/ows-ts6-snat ]; then
+        say 'Имя firewall.ows_ts6_snat занято другим include.'; exit 1
+    fi
+    client=$(get teamspeak.snat_client); client=${client:-192.168.77.2}
+    ask "Локальный IPv4 Windows-клиента [$client]: "; client=${ANSWER:-$client}
+    printf '%s\n' "$client" | awk -F. 'NF != 4 {exit 1} {for(i=1;i<=4;i++) if($i !~ /^[0-9]+$/ || $i>255 || length($i)>3) exit 1}' || { say 'Неверный IPv4.'; exit 1; }
+    iface=$(get teamspeak.snat_wan); iface=${iface:-wan}
+    ask "Логический интерфейс WAN [$iface]: "; iface=${ANSWER:-$iface}
+    case "$iface" in ''|*[!A-Za-z0-9_-]*) exit 1;; esac
+    uci -q get "network.$iface" >/dev/null || { say 'Такой интерфейс отсутствует в конфигурации network.'; exit 1; }
+    install_snat_hooks || exit 1
+    [ "$(get teamspeak)" = service ] || put teamspeak service || exit 1
+    put teamspeak.snat_client "$client" && put teamspeak.snat_wan "$iface" && put teamspeak.snat_enabled 1 || exit 1
+    uci set firewall.ows_ts6_snat=include && uci set firewall.ows_ts6_snat.type=script && uci set firewall.ows_ts6_snat.path=/usr/libexec/ows-ts6-snat && uci set firewall.ows_ts6_snat.fw4_compatible=1 && uci set firewall.ows_ts6_snat.enabled=1 && uci commit firewall || exit 1
+    /usr/libexec/ows-ts6-snat && /etc/init.d/ows-ts6-snat enable || exit 1
+    say 'SNAT включён с автозапуском, обновлением при изменениях WAN и после перезагрузки firewall.'
+    say 'Полностью закройте и заново запустите TeamSpeak; подключайтесь к актуальному внешнему IPv4.'
+    nft list table ip ts6_local_snat 2>/dev/null || say 'WAN пока без IPv4: правило появится после подключения.'
+)
+
 main() {
     [ "$(id -u)" = 0 ] && [ -f /etc/openwrt_release ] || { say 'Запускайте от root на OpenWrt.'; return 1; }
     command -v uci >/dev/null 2>&1 || return 1
@@ -238,7 +368,7 @@ main() {
     touch /etc/config/owrt_services
     [ "$(get main)" = settings ] || put main settings
     while :; do
-        say ''; say "OpenWrt Services 1.2 | $(uname -m) | $(get main.root)"
+        say ''; say "OpenWrt Services 1.4 | $(uname -m) | $(get main.root)"
         say '1 Установить/запустить Docker'
         say '2 Установить или обновить TorrServer'
         say '3 Установить или обновить TeamSpeak'
@@ -249,13 +379,14 @@ main() {
         say '8 Открыть или закрыть порты сервера'
         say '9 Резервная копия данных сервера'
         say '10 Расширение диска отключено'
+        say '11 TS6: внешний IP локального клиента (SNAT)'
         say '0 Выход'
         ask 'Выбор: ' || break
         case "$ANSWER" in
             1) install_docker;;
             2) S=torrserver; deploy;; 3) S=teamspeak; deploy;; 4) S=mumble; deploy;; 5) S=rustdesk; deploy;;
             6) if ready; then docker ps -a --filter "label=owrt.services=$OWNER" --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'; docker system df; fi; df -h;;
-            7) select_service && manage;; 8) select_service && firewall_menu;; 9) select_service && backup_data;; 10) say 'Расширение диска удалено из версии 1.2. Автоматические изменения разделов и файловой системы не выполняются.';; 0) break;; *) say 'Неизвестный пункт.';;
+            7) select_service && manage;; 8) select_service && firewall_menu;; 9) select_service && backup_data;; 10) say 'Расширение диска удалено из версии 1.2. Автоматические изменения разделов и файловой системы не выполняются.';; 11) snat_menu;; 0) break;; *) say 'Неизвестный пункт.';;
         esac
     done
 }
