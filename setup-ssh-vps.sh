@@ -4,12 +4,12 @@ umask 077
 trap 'echo -e "\033[0;31mОшибка на строке ${LINENO}: ${BASH_COMMAND}\033[0m" >&2' ERR
 
 #==============================================================================
-# VPS Setup v4.4.3 - VPN Foundation + SSH Honeypot + Swap + IPv6 Disable + TCP Tune
+# VPS Setup v4.4.4 - VPN Foundation + SSH Honeypot + Swap + IPv6 Disable + TCP Tune + XanMod Fix
 #==============================================================================
 
 G='\033[0;32m'; R='\033[0;31m'; Y='\033[1;33m'; NC='\033[0m'
 
-echo -e "${G}VPS Setup v4.4.3 - VPN Foundation + безопасная настройка SSH${NC}"
+echo -e "${G}VPS Setup v4.4.4 - VPN Foundation + безопасная настройка SSH${NC}"
 
 if [[ ${EUID} -ne 0 ]]; then
   echo -e "${R}Запускайте с root!${NC}"
@@ -341,7 +341,7 @@ chmod 644 /etc/apt/keyrings/xanmod-archive-keyring.gpg
 cat > /etc/apt/sources.list.d/xanmod.sources << EOF
 Types: deb
 URIs: http://deb.xanmod.org
-Suites: ${CODENAME}
+Suites: releases
 Components: main
 Signed-By: /etc/apt/keyrings/xanmod-archive-keyring.gpg
 EOF
