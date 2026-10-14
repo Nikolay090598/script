@@ -4,12 +4,12 @@ umask 077
 trap 'echo -e "\033[0;31mОшибка на строке ${LINENO}: ${BASH_COMMAND}\033[0m" >&2' ERR
 
 #==============================================================================
-# VPS Setup v4.4.5 - VPN Foundation + SSH Honeypot + Swap + IPv6 Disable + TCP Tune + XanMod LTS Fix
+# VPS Setup v4.4.6 - VPN Foundation + SSH Honeypot + Swap + IPv6 Disable + TCP Tune + XanMod LTS Fix
 #==============================================================================
 
 G='\033[0;32m'; R='\033[0;31m'; Y='\033[1;33m'; NC='\033[0m'
 
-echo -e "${G}VPS Setup v4.4.5 - VPN Foundation + безопасная настройка SSH${NC}"
+echo -e "${G}VPS Setup v4.4.6 - VPN Foundation + безопасная настройка SSH${NC}"
 
 if [[ ${EUID} -ne 0 ]]; then
   echo -e "${R}Запускайте с root!${NC}"
@@ -252,7 +252,6 @@ if [[ "$SETUP_ONLY" =~ ^[Yy]$ ]]; then
   done
 else
 echo -e "${G}[1/4] Базовая настройка (Обновление, Время, Логи, Swap)${NC}"
-# Не угадываем диск для загрузчика: исправляем устаревший debconf интерактивно.
 check_grub_devices() {
   local devices="" device missing=0
   if ! dpkg-query -W -f='${Status}' grub-pc 2>/dev/null | grep -q 'install '; then
@@ -315,7 +314,6 @@ if (( SWAP_SIZE_GB > 0 )); then
     free_bytes="$(df -B1 --output=avail / | tail -n 1 | tr -d ' ')"
     required_bytes="$((SWAP_SIZE_GB * 1024 * 1024 * 1024))"
     (( free_bytes > required_bytes + 1073741824 )) || { echo "Недостаточно места для swap и запаса 1 GB" >&2; exit 1; }
-    # dd исключает дырки в файле; не перезаписываем существующий swap.
     dd if=/dev/zero of=/swapfile bs=1M count="$((SWAP_SIZE_GB * 1024))" status=progress
     chmod 600 /swapfile
     mkswap /swapfile
@@ -331,41 +329,70 @@ fi
 
 echo -e "${G}[2/4] Ядро${NC}"
 if [[ "$INSTALL_XANMOD" =~ ^[Yy]$ ]]; then
-[[ "$(dpkg --print-architecture)" == amd64 ]] || { echo "XanMod требует amd64" >&2; exit 1; }
-for flag in cx16 lahf_lm popcnt ssse3 sse4_1 sse4_2; do
-  has_flag "$flag" || { echo "CPU не поддерживает x86-64-v2: $flag. Сохраните штатное ядро." >&2; exit 1; }
-done
-install -m 0755 -d /etc/apt/keyrings
-wget -qO- https://dl.xanmod.org/archive.key | gpg --batch --yes --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg
-chmod 644 /etc/apt/keyrings/xanmod-archive-keyring.gpg
-cat > /etc/apt/sources.list.d/xanmod.sources << EOF
+  [[ "$(dpkg --print-architecture)" == amd64 ]] || { echo "XanMod требует amd64" >&2; exit 1; }
+  for flag in cx16 lahf_lm popcnt ssse3 sse4_1 sse4_2; do
+    has_flag "$flag" || { echo "CPU не поддерживает x86-64-v2: $flag. Сохраните штатное ядро." >&2; exit 1; }
+  done
+  install -m 0755 -d /etc/apt/keyrings
+  wget -qO- https://dl.xanmod.org/archive.key | gpg --batch --yes --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg
+  chmod 644 /etc/apt/keyrings/xanmod-archive-keyring.gpg
+  cat > /etc/apt/sources.list.d/xanmod.sources << EOF
 Types: deb
 URIs: http://deb.xanmod.org
 Suites: ${CODENAME}
 Components: main
 Signed-By: /etc/apt/keyrings/xanmod-archive-keyring.gpg
 EOF
-apt update
+  apt update
 
-# Каскадная установка: пробуем MAIN, если нет (как на Debian 12) - ставим LTS
-if supports_x64v3; then
-  apt install -y linux-xanmod-x64v3 || apt install -y linux-xanmod-lts-x64v3 || apt install -y linux-xanmod-x64v2 || apt install -y linux-xanmod-lts-x64v2
-else
-  apt install -y linux-xanmod-x64v2 || apt install -y linux-xanmod-lts-x64v2
-fi
+  # Выбираем доступный пакет без ложных ошибок apt в консоли
+  if supports_x64v3; then
+     CANDIDATES=(linux-xanmod-x64v3 linux-xanmod-lts-x64v3 linux-xanmod-x64v2 linux-xanmod-lts-x64v2)
+  else
+    CANDIDATES=(linux-xanmod-x64v2 linux-xanmod-lts-x64v2)
+  fi
+  XANMOD_PKG=""
+  for pkg in "${CANDIDATES[@]}"; do
+    if apt-cache show "$pkg" >/dev/null 2>&1; then
+      XANMOD_PKG="$pkg"
+      break
+    fi
+  done
+  if [[ -n "$XANMOD_PKG" ]]; then
+    echo -e "${G}Устанавливается пакет ядра: ${XANMOD_PKG}${NC}"
+    apt install -y "$XANMOD_PKG"
+  else
+    echo -e "${R}Не удалось найти подходящий пакет XanMod в репозитории.${NC}" >&2
+    exit 1
+  fi
 else
   echo "Сохраняется штатное ядро."
 fi
 
 echo -e "${G}[3/4] Сеть (BBR, буферы TCP, Форвардинг и отключение IPv6)${NC}"
 
-# Отключаем IPv6 и прописываем быстрые DNS для защиты от утечек
-mkdir -p /etc/systemd/resolved.conf.d
-cat > /etc/systemd/resolved.conf.d/99-custom-dns.conf << 'EOF'
+# Настраиваем быстрые зарубежные DNS (Cloudflare + Google)
+if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+  mkdir -p /etc/systemd/resolved.conf.d
+  cat > /etc/systemd/resolved.conf.d/99-custom-dns.conf << 'EOF'
 [Resolve]
-DNS=77.88.8.8 223.5.5.5
+DNS=1.1.1.1 8.8.8.8
+FallbackDNS=1.0.0.1 9.9.9.9
 EOF
-systemctl restart systemd-resolved 2>/dev/null || true
+  systemctl restart systemd-resolved
+elif [[ -f /etc/resolv.conf && ! -L /etc/resolv.conf ]]; then
+  cp -a /etc/resolv.conf "$BACKUP/resolv.conf"
+  cat > /etc/resolv.conf << 'EOF'
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+nameserver 1.0.0.1
+EOF
+fi
+
+# Синхронизируем отключение IPv6 с конфигурацией UFW
+if [[ -f /etc/default/ufw ]]; then
+  sed -i 's/^IPV6=yes/IPV6=no/' /etc/default/ufw
+fi
 
 cat > /etc/sysctl.d/99-vpn.conf << 'EOF'
 # Отключение IPv6
@@ -373,14 +400,14 @@ net.ipv6.conf.all.disable_ipv6=1
 net.ipv6.conf.default.disable_ipv6=1
 net.ipv6.conf.lo.disable_ipv6=1
 
-# Форвардинг (оставляем только IPv4)
+# Форвардинг (только IPv4)
 net.ipv4.ip_forward=1
 
 # BBR и алгоритм очередей
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 
-# Тюнинг TIME_WAIT и Keep-Alive (Критично для прокси 3x-ui)
+# Тюнинг TIME_WAIT и Keep-Alive (для прокси 3x-ui / Xray / Sing-box)
 net.ipv4.tcp_tw_reuse=1
 net.ipv4.tcp_fin_timeout=15
 net.ipv4.tcp_max_tw_buckets=2000000
@@ -388,6 +415,7 @@ net.ipv4.tcp_keepalive_time=600
 net.ipv4.tcp_keepalive_probes=5
 net.ipv4.tcp_keepalive_intvl=15
 net.ipv4.tcp_max_syn_backlog=8192
+net.core.netdev_max_backlog=16384
 
 # Быстрое открытие и MTU
 net.ipv4.tcp_fastopen=3
@@ -485,7 +513,7 @@ if [[ -n "$SSH_KEY" ]]; then
   chmod 600 /root/.ssh/authorized_keys
 fi
 
-# Управляемые правила ловушки. Удаляются только блоки с известными маркерами.
+# Управляемые правила ловушки с защитой от лог-флуда (-m limit).
 cat > /root/vps-port22-rules.py << 'RULEPY'
 #!/usr/bin/python3
 import os, re, sys, tempfile
@@ -511,7 +539,7 @@ if mode == 'add':
         raise SystemExit('Не найдена входящая цепочка UFW: ' + filename)
     pos = a + rule.start()
     block = '''# ===== VPS_PORT22_TRAP_START =====
--A ufw-before-input -p tcp --dport 22 --tcp-flags SYN,RST,ACK SYN -m conntrack --ctstate NEW -j LOG --log-prefix "VPS_PORT22_TRAP: "
+-A ufw-before-input -p tcp --dport 22 --tcp-flags SYN,RST,ACK SYN -m conntrack --ctstate NEW -m limit --limit 6/min --limit-burst 10 -j LOG --log-prefix "VPS_PORT22_TRAP: "
 -A ufw-before-input -p tcp --dport 22 -j DROP
 # ===== VPS_PORT22_TRAP_END =====
 '''
@@ -626,7 +654,7 @@ fi
   if [[ "$CURRENT_PORT" =~ ^[0-9]+$ && "$CURRENT_PORT" != 22 && "$CURRENT_PORT" != "$SSH_PORT" ]]; then
     printf 'Port %s\n' "$CURRENT_PORT"
   fi
-  # Парольные методы пока сохраняются: режим только ключ проверяется на втором шаге.
+  echo 'AddressFamily inet'
   echo 'PubkeyAuthentication yes'
   echo 'PermitRootLogin yes'
   echo 'MaxAuthTries 6'
@@ -655,7 +683,7 @@ ss -H -lntp 'sport = :22' | grep -q sshd
 ufw default deny incoming
 ufw default allow outgoing
 ufw --force enable
-IGN='127.0.0.1/8 ::1'
+IGN='127.0.0.1/8'
 [[ -z "$WL_IP" ]] || IGN="$IGN $WL_IP"
 # Только отдельный управляемый файл; пользовательский jail.local не перезаписываем.
 install -d -m 755 /etc/fail2ban/jail.d
@@ -721,7 +749,7 @@ restore() {
   cp -a "$BACKUP/config" "$CONF"
   cp -a "$BACKUP/jail" /etc/fail2ban/jail.d/99-vps-ssh.local
   ufw delete deny log 22/tcp 2>/dev/null || true
-  ufw allow 22/tcp || true
+  ufw allow 22/tcp comment 'SSH fallback' || true
   cp -a "$BACKUP/before.rules" /etc/ufw/before.rules
   [[ ! -f "$BACKUP/before6.rules" ]] || cp -a "$BACKUP/before6.rules" /etc/ufw/before6.rules
   ufw reload || true
@@ -737,6 +765,7 @@ else
 fi
 cat > "$CONF" << EOF
 Port $SSH_PORT
+AddressFamily inet
 PubkeyAuthentication yes
 PasswordAuthentication $AUTH
 KbdInteractiveAuthentication $AUTH
@@ -758,16 +787,15 @@ sed -i "s/^port =.*/port = $SSH_PORT/" /etc/fail2ban/jail.d/99-vps-ssh.local
 sed -i '/^\[port22-trap\]/,$ s/^enabled = false$/enabled = true/' /etc/fail2ban/jail.d/99-vps-ssh.local
 fail2ban-client -t
 systemctl restart fail2ban
-# Первая запрещающая запись перекрывает старые разрешения, в том числе IPv6.
-# Ловушка логирует TCP SYN до DROP. Сервис SSH на 22 не запускается.
 if [[ "$KEY_ONLY" =~ ^[Yy]$ ]]; then
   effective="$(/usr/sbin/sshd -T -C "user=root,host=localhost,addr=${SSH_CONNECTION%% *}")"
   grep -Fxq 'passwordauthentication no' <<< "$effective"
   grep -Fxq 'kbdinteractiveauthentication no' <<< "$effective"
   grep -Fxq 'pubkeyauthentication yes' <<< "$effective"
 fi
+ufw delete allow 22/tcp 2>/dev/null || true
 python3 /root/vps-port22-rules.py add /etc/ufw/before.rules
-if [[ -f /etc/ufw/before6.rules ]]; then
+if [[ -f /etc/ufw/before6.rules ]] && grep -qi '^IPV6=yes' /etc/default/ufw; then
   python3 /root/vps-port22-rules.py add /etc/ufw/before6.rules
 fi
 iptables-restore --test < /etc/ufw/before.rules
