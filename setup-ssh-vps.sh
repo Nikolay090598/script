@@ -4,12 +4,12 @@ umask 077
 trap 'echo -e "\033[0;31mОшибка на строке ${LINENO}: ${BASH_COMMAND}\033[0m" >&2' ERR
 
 #==============================================================================
-# VPS Setup v4.4.6 - VPN Foundation + SSH Honeypot + Swap + IPv6 Disable + TCP Tune + XanMod LTS Fix
+# VPS Setup v4.4.7 - VPN Foundation + SSH Honeypot + Swap + IPv6 Disable + TCP Tune + XanMod LTS Fix
 #==============================================================================
 
 G='\033[0;32m'; R='\033[0;31m'; Y='\033[1;33m'; NC='\033[0m'
 
-echo -e "${G}VPS Setup v4.4.6 - VPN Foundation + безопасная настройка SSH${NC}"
+echo -e "${G}VPS Setup v4.4.7 - VPN Foundation + безопасная настройка SSH${NC}"
 
 if [[ ${EUID} -ne 0 ]]; then
   echo -e "${R}Запускайте с root!${NC}"
@@ -279,6 +279,17 @@ for directory in ufw fail2ban; do
   [[ ! -d "/etc/$directory" ]] || cp -a "/etc/$directory" "$BACKUP/$directory"
 done
 printf '%s\n' "$BACKUP" > /root/.vps-backup-path
+
+# Сразу отключаем IPv6 и переводим APT на IPv4, чтобы избежать таймаутов при скачивании пакетов
+sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.lo.disable_ipv6=1 >/dev/null 2>&1 || true
+
+cat > /etc/apt/apt.conf.d/99-force-ipv4 << 'EOF'
+Acquire::ForceIPv4 "true";
+Acquire::Retries "3";
+EOF
+
 check_grub_devices
 export DEBIAN_FRONTEND=noninteractive
 dpkg --configure -a
@@ -304,8 +315,7 @@ if (( SWAP_SIZE_GB > 0 )); then
   if [[ -e /swapfile || -L /swapfile ]]; then
     [[ -f /swapfile && ! -L /swapfile ]] || { echo "Небезопасный /swapfile" >&2; exit 1; }
     [[ "$(blkid -p -s TYPE -o value /swapfile || true)" == swap ]] || {
-      echo "/swapfile существует, но не является swap. Не перезаписываю." >&2; exit 1;
-    }
+      echo "/swapfile существует, но не является swap. Не перезаписываю." >&2; exit 1; }
   else
     fs_type="$(findmnt -n -o FSTYPE -T /)"
     [[ "$fs_type" == ext4 || "$fs_type" == xfs ]] || {
@@ -334,11 +344,11 @@ if [[ "$INSTALL_XANMOD" =~ ^[Yy]$ ]]; then
     has_flag "$flag" || { echo "CPU не поддерживает x86-64-v2: $flag. Сохраните штатное ядро." >&2; exit 1; }
   done
   install -m 0755 -d /etc/apt/keyrings
-  wget -qO- https://dl.xanmod.org/archive.key | gpg --batch --yes --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg
+  wget -4 -qO- https://dl.xanmod.org/archive.key | gpg --batch --yes --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg
   chmod 644 /etc/apt/keyrings/xanmod-archive-keyring.gpg
   cat > /etc/apt/sources.list.d/xanmod.sources << EOF
 Types: deb
-URIs: http://deb.xanmod.org
+URIs: https://deb.xanmod.org
 Suites: ${CODENAME}
 Components: main
 Signed-By: /etc/apt/keyrings/xanmod-archive-keyring.gpg
@@ -347,7 +357,7 @@ EOF
 
   # Выбираем доступный пакет без ложных ошибок apt в консоли
   if supports_x64v3; then
-     CANDIDATES=(linux-xanmod-x64v3 linux-xanmod-lts-x64v3 linux-xanmod-x64v2 linux-xanmod-lts-x64v2)
+    CANDIDATES=(linux-xanmod-x64v3 linux-xanmod-lts-x64v3 linux-xanmod-x64v2 linux-xanmod-lts-x64v2)
   else
     CANDIDATES=(linux-xanmod-x64v2 linux-xanmod-lts-x64v2)
   fi
