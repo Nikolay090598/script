@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# VPS Foundation 6.0: interactive VPS setup and maintenance for Debian/Ubuntu.
+# VPS Foundation 6.0.1: interactive VPS setup and maintenance for Debian/Ubuntu.
 set -Eeuo pipefail
 umask 077
 export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
-APP_VERSION=6.0
+APP_VERSION=6.0.1
 COWRIE_VERSION=3.1.2
 TX_OWNED=0
 EXTRA_PORTS=''
@@ -684,6 +684,49 @@ EOF
   say "Выбран $pkg, версия $candidate"; apt-get -s install "$pkg" >/dev/null; apt-get install -y "$pkg"
 }
 
+normalize_f2b_db_value() {
+  # fail2ban-client beautifies these replies; do not extract arbitrary digits.
+  python3 - "$1" "$2" <<'PY'
+import ast,re,sys
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
+kind,raw=sys.argv[1:]
+value=raw.strip()
+heading={'dbpurgeage':'Current database purge age is:', 'dbfile':'Current database file is:'}.get(kind)
+if heading is None:
+    raise SystemExit('Unknown Fail2ban database field')
+if value.startswith(heading):
+    value=value[len(heading):].strip()
+    value=re.sub(r"^[`'|+]-\s*",'',value).strip()
+if kind=='dbpurgeage':
+    match=re.fullmatch(r'([0-9]+(?:\.[0-9]+)?(?:[eE][+\-]?[0-9]+)?)\s*(?:s|seconds?)?',value,re.I)
+    if match:
+        try:
+            number=Decimal(match[1])
+            if number.is_finite() and 0<=number<=10**12:
+                print(int(number.to_integral_value(rounding=ROUND_CEILING)))
+                sys.exit(0)
+        except (InvalidOperation,OverflowError,ValueError):
+            pass
+else:
+    if value[:1] in ('"',"'"):
+        try: value=ast.literal_eval(value)
+        except (ValueError,SyntaxError): value=None
+    if isinstance(value,str) and value.startswith('/') and not any(c in value for c in ('\n','\r','\x00')):
+        print(value)
+        sys.exit(0)
+    raise SystemExit('Нет подтверждённой постоянной БД Fail2ban (None/:memory:/неизвестный ответ). Ответ: '+repr(raw))
+raise SystemExit('Не удалось распознать dbpurgeage Fail2ban. Ответ: '+repr(raw))
+PY
+}
+read_f2b_db_value() {
+  local field="$1" raw
+  if ! raw="$(fail2ban-client get "$field")"; then
+    say "Не удалось запросить $field у Fail2ban." >&2
+    return 1
+  fi
+  normalize_f2b_db_value "$field" "$raw"
+}
+
 restore_bans() {
   local failed=0 name dst old
   [[ -n "$BAN_BACKUP" && -d "$BAN_BACKUP" ]] || return 1
@@ -694,8 +737,9 @@ restore_bans() {
   done
   fail2ban-client -t || failed=1; fail2ban-client reload || failed=1
   if [[ -f "$BAN_BACKUP/retention.old" ]]; then
-    old="$(cat "$BAN_BACKUP/retention.old")"
-    if [[ "$old" =~ ^[0-9]+$ ]]; then fail2ban-client set dbpurgeage "$old" >/dev/null || failed=1; fi
+    if old="$(normalize_f2b_db_value dbpurgeage "$(cat "$BAN_BACKUP/retention.old")")"; then
+      fail2ban-client set dbpurgeage "$old" >/dev/null || failed=1
+    else failed=1; fi
   fi
   ((failed==0)) || return 1; BAN_CHANGED=0
   say 'Прежняя конфигурация банов и срок хранения истории возвращены; SSH не перенастраивался.'
@@ -716,8 +760,9 @@ install_bans() {
   ((BAN_DAYS>=1 && BAN_DAYS<=365 && BAN_RETRIES>=1 && BAN_RETRIES<=20 && BAN_WINDOW>=60 && BAN_WINDOW<=86400)) || die 'Параметры банов вне диапазона.'
   [[ "$BAN_SCOPE" == 1 || "$BAN_SCOPE" == 2 ]] || die 'Неверная область бана.'
   fail2ban-client -t
-  db="$(fail2ban-client get dbfile)"; [[ -n "$db" && "$db" != None && "$db" != none ]] || die 'Постоянная БД Fail2ban отключена: сначала включите dbfile для восстановления длительных банов.'
-  oldkeep="$(fail2ban-client get dbpurgeage)"; [[ "$oldkeep" =~ ^[0-9]+$ ]] || die 'Не удалось прочитать dbpurgeage.'
+  db="$(read_f2b_db_value dbfile)" || die 'Нужна постоянная БД Fail2ban для восстановления длительных банов.'
+  oldkeep="$(read_f2b_db_value dbpurgeage)" || die 'Не удалось прочитать dbpurgeage; исходный ответ приведён выше.'
+  say "БД Fail2ban: $db; текущее хранение: $oldkeep с."
   keep=$(((BAN_DAYS+10)*86400)); if ((keep<3456000)); then keep=3456000; fi
   if ((oldkeep>keep)); then keep="$oldkeep"; fi
   BAN_BACKUP="$(mktemp -d "$STATE/bans-backup.XXXXXXXX")"; printf '%s\n' "$oldkeep" > "$BAN_BACKUP/retention.old"
@@ -1264,7 +1309,7 @@ disable_bans() {
     case "$name" in filter) dst="$BAN_FILTER" ;; jail) dst="$BAN_JAIL" ;; global) dst="$BAN_GLOBAL" ;; esac
     [[ ! -f "$dst" ]] || cp -a "$dst" "$BAN_BACKUP/$name.old"
   done
-  fail2ban-client get dbpurgeage > "$BAN_BACKUP/retention.old"
+  read_f2b_db_value dbpurgeage > "$BAN_BACKUP/retention.old"
   BAN_CHANGED=1
   printf '# VPS_COWRIE_BANS_MANAGED\n[vps-cowrie-auth]\nenabled = false\n' > "$BAN_JAIL"
   fail2ban-client -t; fail2ban-client reload
