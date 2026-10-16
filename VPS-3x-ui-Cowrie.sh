@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VPS Foundation for 3x-ui/Xray: TCP profiles, XanMod LTS/MAIN, Cowrie.
+# VPS Foundation for 3x-ui/Xray: packages, TCP profiles, XanMod LTS/MAIN, SSH, Cowrie.
 set -Eeuo pipefail
 umask 077
 export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -11,22 +11,26 @@ MANAGED=/etc/ssh/vps-foundation.conf
 JAIL=/etc/fail2ban/jail.d/99-vps-foundation.local
 TIMER=vps-foundation-rollback.timer
 SERVICE=vps-foundation-rollback.service
-ACTIVE_TX=''; SWAP_TMP=''; TTY_FD=''
+ACTIVE_TX=''; SWAP_TMP=''; TTY_FD=''; ASSUME_START=0
 say() { printf '%s\n' "$*"; }
 die() {
   say "ОШИБКА: $*" >&2
+  if [[ -n "$SWAP_TMP" && -f "$SWAP_TMP" ]]; then rm -f -- "$SWAP_TMP"; fi
   if [[ -n "$ACTIVE_TX" && -f "$ACTIVE_TX/snapshot.sh" ]]; then
     trap - ERR HUP INT TERM
     rollback_impl || say 'Откат неполный: нужна консоль VPS.' >&2
   fi
   exit 1
 }
-need() { command -v "$1" >/dev/null 2>&1 || die "Нет $1. Установите начальные зависимости из инструкции."; }
-ask() {
-  local _pv="$1" _pm="$2" _pd="${3-}" _answer=''
+need() { command -v "$1" >/dev/null 2>&1 || die "Нет команды $1."; }
+open_tty() {
   if [[ -z "$TTY_FD" ]]; then
     if ! { exec {TTY_FD}<>/dev/tty; } 2>/dev/null; then die 'Нужен доступный /dev/tty.'; fi
   fi
+}
+ask() {
+  local _pv="$1" _pm="$2" _pd="${3-}" _answer=''
+  open_tty
   printf '%s' "$_pm${_pd:+ [$_pd]}: " >&"$TTY_FD"
   IFS= read -r -t 90 _answer <&"$TTY_FD" || die 'Ввод прерван или истекли 90 секунд.'
   _answer="${_answer%$'\r'}"
@@ -266,16 +270,22 @@ ssh_setup() {
   [[ ! -f "$ACTIVE" ]] || die 'Настройка уже активна. Завершите её либо выполните --rollback.'
   local t sockets answer
   for t in python3 ufw fail2ban-client ss iptables-restore ip6tables-restore timeout; do need "$t"; done
+  [[ -f /etc/ufw/before.rules && -f /etc/default/ufw ]] || die 'UFW установлен некорректно: нет /etc/ufw/before.rules.'
   /usr/sbin/sshd -t
+  if [[ -e /proc/net/if_inet6 ]] && [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 1)" == 0 ]]; then
+    grep -Eqi '^IPV6=yes' /etc/default/ufw || die 'IPv6 включён, а UFW настроен с IPV6=no. Исправьте /etc/default/ufw; IPv6 автоматически не отключаю.'
+  fi
   if [[ "$HONEYPOT" == y ]]; then check_cowrie_prepared; fi
   if [[ -n "${SSH_CONNECTION:-}" ]]; then connection
   else REMOTE_IP=127.0.0.1; LOCAL_IP=127.0.0.1; LOCAL_PORT=''; fi
   sockets="$(ss -H -lntp "sport = :$SSH_PORT")"
   [[ -z "$sockets" || "$sockets" == *sshd* ]] || die "Порт $SSH_PORT занят."
-  say 'UFW будет включён: incoming DENY, outgoing ALLOW. Другие нужные порты разрешите заранее.'
-  say '80/tcp, 443/tcp, 443/udp и SSH будут разрешены. Порт панели автоматически не открывается.'
-  ask answer 'Для применения с 15-минутным откатом введите START' ''
-  [[ "$answer" == START ]] || return 0
+  say 'UFW будет включён: incoming DENY, outgoing ALLOW. Разрешаются 80/tcp, 443/tcp, 443/udp и SSH.'
+  say 'Порт панели и другие inbounds автоматически НЕ открываются.'
+  if [[ "$ASSUME_START" != 1 ]]; then
+    ask answer 'Для применения с 15-минутным откатом введите START' ''
+    [[ "$answer" == START ]] || return 0
+  fi
   snapshot
   if [[ -f /etc/systemd/system/vps-cowrie.service ]]; then
     timeout 45s systemctl stop vps-cowrie.service
@@ -312,17 +322,31 @@ ssh_setup() {
   write_jail "22,$SSH_PORT${LOCAL_PORT:+,$LOCAL_PORT}"
   systemctl enable fail2ban.service >/dev/null
   timeout 45s systemctl restart fail2ban.service
-  say "ШАГ 1: откройте новый root SSH-вход на $SSH_PORT и выполните bash /root/finalize-ssh.sh"
-  say 'Исходную сессию не закрывайте. Откат через 15 минут без завершения настройки.'
+  say ''
+  say "SSH ПЕРЕНЕСЁН на порт $SSH_PORT (22 пока тоже работает). Автооткат через 15 минут."
+  say "1) Откройте НОВОЕ окно терминала: ssh -p $SSH_PORT root@SERVER_IP"
+  say '2) В нём выполните ОДНУ команду: bash /root/finalize-ssh.sh'
+  say 'Эту исходную сессию не закрывайте.'
+}
+wait_confirm() {
+  local answer=''
+  printf 'Введите CONFIRM или ROLLBACK (ожидание до 10 минут): ' >&"$TTY_FD"
+  while IFS= read -r -t 600 answer <&"$TTY_FD"; do
+    case "${answer%$'\r'}" in
+      CONFIRM) return 0 ;;
+      ROLLBACK) return 1 ;;
+      *) printf 'Введите CONFIRM или ROLLBACK: ' >&"$TTY_FD" ;;
+    esac
+  done
+  return 1
 }
 finalize() {
-  load_config; read_active || die 'Нет активной настройки.'
+  load_config; read_active || die 'Нет активной настройки (уже подтверждена либо выполнен откат).'
+  open_tty
   connection
-  [[ "$LOCAL_PORT" == "$SSH_PORT" ]] || die "Нужна сессия на $SSH_PORT."
-  [[ "$(cat "$ACTIVE_TX/stage")" == initial ]] || die 'Уже финализировано; нужен новый вход и --confirm.'
-  local answer ports
-  ask answer 'Вход проверен? Введите FINALIZE' ''
-  [[ "$answer" == FINALIZE ]] || return 0
+  [[ "$LOCAL_PORT" == "$SSH_PORT" ]] || die "Запустите в НОВОЙ сессии на порту $SSH_PORT."
+  [[ "$(cat "$ACTIVE_TX/stage")" == initial ]] || die 'Финализация уже выполнялась.'
+  local ports conns
   systemctl restart "$TIMER"
   write_sshd final
   /usr/sbin/sshd -t
@@ -342,33 +366,30 @@ finalize() {
     cowrie_listener_ok
   fi
   timeout 45s systemctl restart fail2ban.service
-  printf '%s\n' "$SSH_CONNECTION" > "$ACTIVE_TX/finalize-connection"
   printf '%s\n' finalized > "$ACTIVE_TX/stage"
   systemctl restart "$TIMER"
-  if [[ "$HONEYPOT" == y ]]; then say 'ШАГ 2: Cowrie отвечает на 22/IPv4; настоящий SSH на новом порту.'
-  else say 'ШАГ 2: 22 закрыт для новых подключений.'; fi
-  say 'Откройте ЕЩЁ ОДНО новое соединение без multiplexing и выполните bash /root/confirm-ssh.sh'
-  say 'До CONFIRM остаётся автооткат через 15 минут.'
-}
-confirm() {
-  load_config; read_active || die 'Нет активной настройки.'
-  connection
-  [[ "$LOCAL_PORT" == "$SSH_PORT" ]] || die "Нужна сессия на $SSH_PORT."
-  [[ "$(cat "$ACTIVE_TX/stage")" == finalized ]] || die 'Сначала выполните finalize-ssh.sh.'
-  [[ "$SSH_CONNECTION" != "$(cat "$ACTIVE_TX/finalize-connection")" ]] || die 'Нужно другое SSH-соединение. Используйте ssh -S none -o ControlMaster=no.'
-  local answer
-  ask answer 'Проверен НОВЫЙ вход после FINALIZE? Введите CONFIRM' ''
-  [[ "$answer" == CONFIRM ]] || return 0
+  if [[ "$HONEYPOT" == y ]]; then say 'Настоящий SSH только на новом порту; на 22 работает Cowrie.'
+  else say 'Настоящий SSH только на новом порту; 22 закрыт для новых подключений.'; fi
+  say ''
+  say "Откройте ЕЩЁ ОДНО новое окно и убедитесь, что вход на порт $SSH_PORT работает."
+  say 'Затем вернитесь сюда и введите CONFIRM. ROLLBACK — вернуть прежнюю конфигурацию.'
+  while true; do
+    wait_confirm || die 'Подтверждение не получено; выполняю откат.'
+    conns="$(ss -Htn state established "( sport = :$SSH_PORT )" | wc -l)"
+    if ((conns >= 2)); then break; fi
+    say 'Не вижу второго подключения на этом порту. Откройте новое окно и повторите.'
+  done
   /usr/sbin/sshd -t; validate_effective; listener_ok; fail2ban-client -t
   if [[ "$HONEYPOT" == y ]]; then cowrie_listener_ok; fi
   cancel_timer
   printf '%s\n' "$ACTIVE_TX" > "$STATE/last-confirmed"
   rm -f "$ACTIVE"; ACTIVE_TX=''
-  say 'ГОТОВО. Таймер отката отменён; снимок сохранён.'
+  say 'ГОТОВО. Автооткат отменён; снимок сохранён.'
   if [[ "$HONEYPOT" == y ]]; then
-    say 'Журналы: /var/lib/vps-cowrie/var/log/cowrie/'
-    say 'Не отключайте UFW при работающем Cowrie: он ограничивает исходящие соединения honeypot.'
+    say 'Журналы Cowrie: /var/lib/vps-cowrie/var/log/cowrie/'
+    say 'Не отключайте UFW при работающем Cowrie: он ограничивает его исходящие соединения.'
   fi
+  say 'Если ставилось новое ядро — перезагрузитесь командой reboot.'
 }
 make_swap() {
   ((SWAP_SIZE_GB > 0)) || return 0
@@ -395,7 +416,6 @@ make_swap() {
   if ! grep -Fxq /swapfile <<< "$swaps"; then swapon /swapfile; fi
   if ! awk '$1 == "/swapfile" {f=1} END {exit !f}' /etc/fstab; then printf '%s\n' '/swapfile none swap sw 0 0' >> /etc/fstab; fi
 }
-
 port22_rules() {
   local mode="$1" file uid=0
   if [[ "$HONEYPOT" == y ]]; then uid="$(id -u vps-cowrie)"; fi
@@ -464,12 +484,9 @@ PY
     ip6tables-restore --test < /etc/ufw/before6.rules
   fi
 }
-
 prepare_cowrie() {
   local home=/var/lib/vps-cowrie venv=/opt/vps-cowrie
-  if [[ -e "$home" && ! -f "$home/.vps-managed" ]]; then
-    die "$home существует и не принадлежит этой установке. Не перезаписываю."
-  fi
+  if [[ -e "$home" && ! -f "$home/.vps-managed" ]]; then die "$home существует и не принадлежит этой установке."; fi
   if id vps-cowrie >/dev/null 2>&1; then
     [[ "$(getent passwd vps-cowrie | cut -d: -f6)" == "$home" ]] || die 'Конфликт пользователя vps-cowrie.'
   else
@@ -490,8 +507,8 @@ prepare_cowrie() {
   if [[ ! -f "$home/etc/cowrie.cfg" ]]; then
     runuser -u vps-cowrie -- /bin/bash -c 'cd "$1"; exec /opt/vps-cowrie/bin/cowrie init' _ "$home"
   fi
-  local endpoints='tcp:22:interface=0.0.0.0'
-  cp -a "$home/etc/cowrie.cfg" "$home/etc/cowrie.cfg.before-vps"
+  [[ -d "$home/etc" ]] || die 'cowrie init не создал каталог etc.'
+  [[ ! -f "$home/etc/cowrie.cfg" ]] || cp -a "$home/etc/cowrie.cfg" "$home/etc/cowrie.cfg.before-vps"
   cat > "$home/etc/cowrie.cfg" <<EOF
 [honeypot]
 hostname = srv-cache
@@ -500,7 +517,7 @@ backend = shell
 download_limit_size = 10485760
 [ssh]
 enabled = true
-listen_endpoints = $endpoints
+listen_endpoints = tcp:22:interface=0.0.0.0
 forwarding = false
 sftp_enabled = false
 [telnet]
@@ -561,10 +578,10 @@ UNIT
   chmod 644 /etc/systemd/system/vps-cowrie.service
   systemctl daemon-reload
   "$venv/bin/python" -m pip freeze > "$home/installed-packages.txt"
-  say 'Cowrie подготовлен, но ещё НЕ запущен. Запуск только после переноса настоящего SSH.'
+  say 'Cowrie подготовлен, но ещё НЕ запущен: стартует после переноса настоящего SSH.'
 }
 check_cowrie_prepared() {
-  [[ -x /opt/vps-cowrie/bin/cowrie && -f /var/lib/vps-cowrie/.vps-managed && -f /etc/systemd/system/vps-cowrie.service ]] || die 'Cowrie не подготовлен. Нужен полный режим.'
+  [[ -x /opt/vps-cowrie/bin/cowrie && -f /var/lib/vps-cowrie/.vps-managed && -f /etc/systemd/system/vps-cowrie.service ]] || die 'Cowrie не подготовлен.'
   id vps-cowrie >/dev/null
 }
 cowrie_listener_ok() {
@@ -572,7 +589,12 @@ cowrie_listener_ok() {
   for i in {1..10}; do
     if systemctl is-active --quiet vps-cowrie.service; then
       if python3 - <<'PY'
-import socket, sys
+import socket, sys, pwd
+uid = pwd.getpwnam('vps-cowrie').pw_uid
+with open('/proc/net/tcp') as f:
+    rows = [line.split() for line in f.readlines()[1:]]
+if not any(row[1].split(':')[-1] == '0016' and row[3] == '0A' and int(row[7]) == uid for row in rows):
+    sys.exit(1)
 try:
     with socket.create_connection(('127.0.0.1', 22), timeout=2) as s:
         s.settimeout(2)
@@ -629,6 +651,21 @@ EOF
     else say 'BBR недоступен на запущенном ядре. После перезагрузки включите отдельно.'; fi
   fi
   if [[ "$FORWARD" == y ]]; then printf '%s\n' 'net.ipv4.ip_forward=1' >> "$requested"; fi
+  python3 - "$target" "$requested" <<'PY'
+from pathlib import Path
+import sys
+old, requested = map(Path, sys.argv[1:])
+settings = {}
+for p in (old, requested):
+    if not p.exists():
+        continue
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith(('#', ';')) and '=' in line:
+            key, value = line.split('=', 1)
+            settings[key.strip()] = value.strip()
+requested.write_text(''.join(f'{key}={value}\n' for key, value in settings.items()))
+PY
   : > "$backup/runtime.conf"
   : > "$backup/network.new"
   while IFS='=' read -r key value; do
@@ -638,6 +675,7 @@ EOF
       printf '%s=%s\n' "$key" "$value" >> "$backup/network.new"
     else say "Ядро не поддерживает $key; пропускаю."; fi
   done < "$requested"
+  [[ -s "$backup/network.new" ]] || { say 'Нет доступных сетевых параметров; файл не меняется.'; return 0; }
   {
     printf '#!/bin/bash\nset -Eeuo pipefail\n[[ $EUID == 0 ]] || exit 1\n'
     printf 'BACKUP=%q\nTARGET=%q\n' "$backup" "$target"
@@ -659,7 +697,6 @@ RESTORENET
   fi
   say "TCP-профиль: $TCP_PROFILE. Откат сети: bash /root/rollback-tcp.sh"
 }
-
 install_xanmod() {
   [[ "$(dpkg --print-architecture)" == amd64 ]] || die 'XanMod требует amd64.'
   local flags flag candidate key package
@@ -695,43 +732,39 @@ EOF
   chmod 644 /etc/apt/sources.list.d/xanmod.sources
   apt-get -o Acquire::Retries=3 update
   candidate="$(apt-cache policy "$package" | awk '/Candidate:/ {print $2}')"
-  [[ -n "$candidate" && "$candidate" != '(none)' ]] || die "Нет кандидата $package для этого релиза. На части релизов доступна только LTS."
+  [[ -n "$candidate" && "$candidate" != '(none)' ]] || die "Нет кандидата $package для этого релиза."
   say "Выбрано: $package; кандидат APT: $candidate"
   apt-get -s install "$package" >/dev/null
   apt-get install -y "$package"
   say 'Ядро установлено. Штатное ядро не удаляется; перезагрузка только после подтверждения SSH.'
 }
-
 base_setup() {
   local backup
   backup="$(mktemp -d "$STATE/base-backup.XXXXXXXX")"
   cp -a /etc/fstab "$backup/fstab"
   [[ ! -f /etc/sysctl.d/99-vps-foundation.conf ]] || cp -a /etc/sysctl.d/99-vps-foundation.conf "$backup/sysctl.conf"
-  [[ ! -f /etc/apt/sources.list.d/xanmod.sources ]] || cp -a /etc/apt/sources.list.d/xanmod.sources "$backup/xanmod.sources"
-  [[ ! -f /etc/apt/keyrings/xanmod-archive-keyring.gpg ]] || cp -a /etc/apt/keyrings/xanmod-archive-keyring.gpg "$backup/xanmod-key.gpg"
   say "Базовый backup: $backup"
+  export DEBIAN_FRONTEND=noninteractive
   apt-get -o Acquire::Retries=3 update
+  dpkg --configure -a
   if [[ "$UPGRADE" == y ]]; then
-    say 'Обновление пакетов может перезапустить службы и затронуть загрузчик. Полного отката пакетов нет.'
-    DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade
+    apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade
   fi
-  DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server openssh-client ufw fail2ban python3 python3-systemd util-linux iproute2 iptables procps kmod chrony tzdata ca-certificates gnupg wget
+  apt-get install -y openssh-server openssh-client ufw fail2ban python3 python3-systemd util-linux iproute2 iptables procps kmod chrony tzdata ca-certificates gnupg wget curl
   if [[ "$HONEYPOT" == y ]]; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv python3-dev libssl-dev libffi-dev build-essential
+    apt-get install -y python3-venv python3-dev libssl-dev libffi-dev build-essential
     prepare_cowrie
   fi
-  timedatectl set-timezone "$TIMEZONE"
+  timedatectl set-timezone "$TIMEZONE" || true
   systemctl enable --now chrony.service
   make_swap
   if [[ "$XANMOD" != none ]]; then install_xanmod; fi
   configure_network "$backup"
 }
 write_wrappers() {
-  local f mode backup
-  backup="$(mktemp -d "$STATE/commands-backup.XXXXXXXX")"
-  for f in setup-ssh finalize-ssh confirm-ssh rollback-ssh; do
-    case "$f" in setup-ssh) mode=--ssh-setup ;; finalize-ssh) mode=--finalize ;; confirm-ssh) mode=--confirm ;; rollback-ssh) mode=--rollback ;; esac
-    [[ ! -e "/root/$f.sh" ]] || cp -a "/root/$f.sh" "$backup/$f.sh"
+  local f mode
+  for f in setup-ssh finalize-ssh rollback-ssh; do
+    case "$f" in setup-ssh) mode=--ssh-setup ;; finalize-ssh) mode=--finalize ;; rollback-ssh) mode=--rollback ;; esac
     printf '#!/bin/bash\nexec /bin/bash %q %q "$@"\n' "$SELF" "$mode" > "/root/$f.sh"
     chmod 700 "/root/$f.sh"
   done
@@ -739,15 +772,14 @@ write_wrappers() {
 main() {
   [[ ! -f "$ACTIVE" ]] || die 'Есть незавершённая SSH-настройка. Завершите её или выполните --rollback.'
   check_legacy
-  local t input keyfile answer choice tmp v
+  local t input keyfile answer choice tmp v detected_ip=''
   for t in python3 ssh-keygen apt-get dpkg systemctl stat timeout; do need "$t"; done
   [[ -d /run/systemd/system && -f /etc/os-release ]] || die 'Нужны systemd и /etc/os-release.'
   source /etc/os-release
   [[ "${ID:-}" == debian || "${ID:-}" == ubuntu ]] || die 'Поддерживаются Debian/Ubuntu.'
   CODENAME="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
-  [[ -f "${BASH_SOURCE[0]}" ]] || die 'Сохраните скрипт в файл; запуск через pipe не поддерживается.'
+  [[ -f "${BASH_SOURCE[0]}" ]] || die 'Сохраните скрипт в файл (curl -o setup.sh ...); запуск через pipe не поддерживается.'
   say 'VPS Foundation / 3x-ui edition. Сделайте snapshot и проверьте консоль провайдера.'
-  say 'IPv6/DNS не отключаются. Настоящий SSH переносится отдельно от запуска honeypot.'
   ask SSH_PORT 'SSH-порт (не 22/80/443)' 45123
   valid_port "$SSH_PORT" || die 'Некорректный порт.'
   SSH_PORT=$((10#$SSH_PORT))
@@ -766,43 +798,49 @@ main() {
     say 'Парольный root SSH будет разрешён. Скрипт пароль не задаёт.'
     [[ "$(passwd -S root | awk '{print $2}')" == P ]] || die 'Нет активного пароля root; используйте ключ.'
   fi
-  ask WHITELIST_IP 'Статический IP ignoreip Fail2ban; ENTER — не добавлять' ''
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    detected_ip="${SSH_CONNECTION%% *}"
+    if ! detected_ip="$(valid_ip "$detected_ip")"; then detected_ip=''; fi
+  fi
+  if [[ -n "$detected_ip" ]]; then
+    say "Определён ваш текущий IP: $detected_ip"
+    ask WHITELIST_IP 'Whitelist Fail2ban: ENTER — этот IP, "-" — без whitelist, либо другой IP' "$detected_ip"
+  else
+    ask WHITELIST_IP 'Whitelist Fail2ban: IP, либо ENTER — без whitelist' ''
+  fi
+  if [[ "$WHITELIST_IP" == - ]]; then WHITELIST_IP=''; fi
   if [[ -n "$WHITELIST_IP" ]]; then
     if ! WHITELIST_IP="$(valid_ip "$WHITELIST_IP")"; then die 'Некорректный whitelist IP.'; fi
   fi
   yesno HONEYPOT 'Полноценный Cowrie SSH honeypot на 22/IPv4' y
   LOG_PORT22=n
   if [[ "$HONEYPOT" == y ]]; then
-    say 'Cowrie имитирует SSH и shell. Отдельный UID, systemd sandbox, UFW-запрет новых исходящих.'
-    say 'На одном VPS с панелью это дополнительный риск. Для сильной изоляции нужен отдельный VPS.'
-  else yesno LOG_PORT22 'Логировать SYN на закрытом 22 без банов (общий лимит 6/min)' n; fi
-  yesno SETUP_ONLY 'Только SSH, без установки пакетов/TCP/ядра (Cowrie уже должен быть подготовлен)' n
-  SWAP_SIZE_GB=0; TIMEZONE=UTC; UPGRADE=n; XANMOD=none; XANMOD_LEVEL=2; TCP_PROFILE=off; BBR=n; FORWARD=n
-  if [[ "$SETUP_ONLY" == n ]]; then
-    if systemctl is-active --quiet vps-cowrie.service; then die 'Cowrie уже работает. Эта версия не обновляет его на ходу; сначала нужна отдельная проверка.'; fi
-    ask SWAP_SIZE_GB 'Новый swap, GiB (0 — не создавать)' 2
-    [[ "$SWAP_SIZE_GB" =~ ^[0-9]{1,2}$ ]] && ((10#$SWAP_SIZE_GB <= 64)) || die 'Swap: целое 0..64.'
-    SWAP_SIZE_GB=$((10#$SWAP_SIZE_GB))
-    ask TIMEZONE 'Часовой пояс' Asia/Yekaterinburg
-    [[ "$TIMEZONE" =~ ^[A-Za-z0-9_+/-]+$ && "$TIMEZONE" != /* && "$TIMEZONE" != *..* && -f "/usr/share/zoneinfo/$TIMEZONE" ]] || die 'Некорректный часовой пояс.'
-    yesno UPGRADE 'Обновить все установленные пакеты (может затронуть GRUB)' n
-    say 'Ядро: 0) штатное; 1) XanMod LTS; 2) XanMod MAIN (текущая не-LTS ветка).'
-    ask choice 'Ядро (0/1/2)' 0
-    case "$choice" in 0) XANMOD=none ;; 1) XANMOD=lts ;; 2) XANMOD=main ;; *) die 'Выберите 0/1/2.' ;; esac
-    if [[ "$XANMOD" != none ]]; then
-      ask XANMOD_LEVEL 'Уровень CPU: 2 — x64v2; 3 — x64v3 (проверяется)' 2
-      [[ "$XANMOD_LEVEL" == 2 || "$XANMOD_LEVEL" == 3 ]] || die 'Уровень CPU: 2 или 3.'
-    fi
-    say 'TCP: 0) не менять; 1) balanced; 2) throughput — больше буферы/очереди.'
-    ask choice 'TCP-профиль (0/1/2)' 1
-    case "$choice" in 0) TCP_PROFILE=off ;; 1) TCP_PROFILE=balanced ;; 2) TCP_PROFILE=throughput ;; *) die 'Выберите 0/1/2.' ;; esac
-    yesno BBR 'Включить BBR, если доступен в работающем ядре' y
-    yesno FORWARD 'Включить IPv4 forwarding (не настраивает NAT/UFW route)' n
+    say 'Cowrie: отдельный UID, systemd sandbox, UFW-запрет новых исходящих. Это не отдельная VM.'
+  else yesno LOG_PORT22 'Логировать SYN на закрытом 22 без банов' n; fi
+  if systemctl is-active --quiet vps-cowrie.service; then die 'Cowrie уже работает: повторная установка на ходу не поддерживается.'; fi
+  ask SWAP_SIZE_GB 'Новый swap, GiB (0 — не создавать)' 2
+  [[ "$SWAP_SIZE_GB" =~ ^[0-9]{1,2}$ ]] && ((10#$SWAP_SIZE_GB <= 64)) || die 'Swap: целое 0..64.'
+  SWAP_SIZE_GB=$((10#$SWAP_SIZE_GB))
+  ask TIMEZONE 'Часовой пояс' Asia/Yekaterinburg
+  [[ "$TIMEZONE" =~ ^[A-Za-z0-9_+/-]+$ && "$TIMEZONE" != /* && "$TIMEZONE" != *..* && -f "/usr/share/zoneinfo/$TIMEZONE" ]] || die 'Некорректный часовой пояс.'
+  yesno UPGRADE 'Обновить установленные пакеты (apt upgrade)' y
+  XANMOD=none; XANMOD_LEVEL=2
+  say 'Ядро: 0) штатное; 1) XanMod LTS; 2) XanMod MAIN (текущая не-LTS ветка).'
+  ask choice 'Ядро (0/1/2)' 0
+  case "$choice" in 0) XANMOD=none ;; 1) XANMOD=lts ;; 2) XANMOD=main ;; *) die 'Выберите 0/1/2.' ;; esac
+  if [[ "$XANMOD" != none ]]; then
+    ask XANMOD_LEVEL 'Уровень CPU: 2 — x64v2; 3 — x64v3 (проверяется)' 2
+    [[ "$XANMOD_LEVEL" == 2 || "$XANMOD_LEVEL" == 3 ]] || die 'Уровень CPU: 2 или 3.'
   fi
-  say "OS=$ID/$CODENAME SSH=$SSH_PORT key-only=$KEY_ONLY Cowrie=$HONEYPOT"
-  say "TCP=$TCP_PROFILE BBR=$BBR swap=$SWAP_SIZE_GB GiB kernel=$XANMOD/x64v$XANMOD_LEVEL"
-  say 'Порт 3x-ui НЕ открывается автоматически. Нужные входящие порты и firewall провайдера проверьте отдельно.'
-  ask answer 'Сохранить конфигурацию и начать подготовку? Введите START' ''
+  say 'TCP: 0) не менять; 1) balanced; 2) throughput — больше буферы/очереди.'
+  ask choice 'TCP-профиль (0/1/2)' 1
+  case "$choice" in 0) TCP_PROFILE=off ;; 1) TCP_PROFILE=balanced ;; 2) TCP_PROFILE=throughput ;; *) die 'Выберите 0/1/2.' ;; esac
+  yesno BBR 'Включить BBR, если доступен в работающем ядре' y
+  yesno FORWARD 'Включить IPv4 forwarding (не настраивает NAT/UFW route)' n
+  say "OS=$ID/$CODENAME SSH=$SSH_PORT key-only=$KEY_ONLY Cowrie=$HONEYPOT whitelist=${WHITELIST_IP:-нет}"
+  say "TCP=$TCP_PROFILE BBR=$BBR swap=$SWAP_SIZE_GB GiB kernel=$XANMOD/x64v$XANMOD_LEVEL upgrade=$UPGRADE"
+  say 'Порт панели 3x-ui и другие inbounds НЕ открываются автоматически; проверьте и firewall провайдера.'
+  ask answer 'Применить всё и настроить SSH с 15-минутным откатом? Введите START' ''
   [[ "$answer" == START ]] || return 0
   install -d -m 700 "$STATE" "$STATE/transactions"
   if [[ "$(readlink -f -- "${BASH_SOURCE[0]}")" != "$SELF" ]]; then install -m 700 -- "${BASH_SOURCE[0]}" "$SELF"; else chmod 700 "$SELF"; fi
@@ -810,11 +848,12 @@ main() {
   for v in SSH_PORT KEY_ONLY SSH_PUBLIC_KEY WHITELIST_IP LOG_PORT22 HONEYPOT; do printf '%s=%q\n' "$v" "${!v}"; done > "$tmp"
   chmod 600 "$tmp"; mv -f -- "$tmp" "$CONFIG"
   write_wrappers
-  if [[ "$SETUP_ONLY" == n ]]; then base_setup; fi
-  say 'Подготовка завершена. Дальше: bash /root/setup-ssh.sh'
-  say 'Не перезагружайтесь до финальной проверки SSH. Базовые изменения не входят в SSH-откат.'
+  base_setup
+  say 'Базовая настройка завершена. Продолжаю настройку SSH.'
+  ASSUME_START=1
+  ssh_setup
 }
-case "${1:-}" in --help|-h) say 'Сохраните как setup.sh и выполните bash setup.sh; далее setup-ssh, finalize-ssh, confirm-ssh.'; exit 0 ;; esac
+case "${1:-}" in --help|-h) say 'Использование: bash setup.sh'; exit 0 ;; esac
 [[ $EUID == 0 ]] || die 'Запустите от root.'
 need flock
 exec 9>/run/vps-foundation.lock
@@ -823,7 +862,6 @@ case "${1:-}" in
   '') main ;;
   --ssh-setup) ssh_setup ;;
   --finalize) finalize ;;
-  --confirm) confirm ;;
   --rollback) if read_active; then rollback_impl; else say 'Нет активного отката.'; fi ;;
   *) die 'Неизвестный аргумент; используйте --help.' ;;
 esac
