@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# VPS Foundation 6.0.2: interactive VPS setup and maintenance for Debian/Ubuntu.
+# VPS Foundation 6.0.4: interactive VPS setup and maintenance for Debian/Ubuntu.
 set -Eeuo pipefail
 umask 077
 export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
-APP_VERSION=6.0.2
+APP_VERSION=6.0.4
 COWRIE_VERSION=3.1.2
 TX_OWNED=0
 EXTRA_PORTS=''
@@ -491,7 +491,7 @@ UNIT
 }
 prepare_cowrie() {
   local home=/var/lib/vps-cowrie venv=/opt/vps-cowrie
-  python3 -c 'import sys; sys.exit(sys.version_info < (3,10))' || die 'Cowrie требует Python 3.10+. Используйте поддерживаемый релиз Debian/Ubuntu.'
+  python3 -c 'import sys; sys.exit(sys.version_info < (3,11))' || die 'Cowrie требует Python 3.11+. Используйте поддерживаемый релиз Debian/Ubuntu.'
   if systemctl is-active --quiet vps-cowrie.service; then die 'Cowrie уже работает: обновление на ходу не выполняется.'; fi
   [[ ! -e "$home" || -f "$home/.vps-managed" ]] || die 'Нестандартный каталог Cowrie.'
   if id vps-cowrie >/dev/null 2>&1; then [[ "$(getent passwd vps-cowrie|cut -d: -f6)" == "$home" ]] || die 'Конфликт пользователя Cowrie.'
@@ -665,16 +665,52 @@ NETBACK
   chmod 700 /root/rollback-tcp.sh; install -m644 "$backup/network.new" "$target"
   if ! sysctl -p "$target"; then bash /root/rollback-tcp.sh || true; die 'Не удалось применить TCP.'; fi
 }
+normalize_xanmod_choice() {
+  # XanMod publishes only LTS for bookworm. Show the effective choice before START.
+  if [[ "$XANMOD" == main && "${ID:-}" == debian && "${CODENAME:-}" == bookworm ]]; then
+    say 'Debian 12/bookworm: XanMod MAIN не поддерживается; автоматически выбран LTS.'
+    XANMOD=lts
+  fi
+}
+select_xanmod_package() {
+  local branch pkg candidate simulation
+  local -a branches=()
+  [[ "$XANMOD_LEVEL" == 2 || "$XANMOD_LEVEL" == 3 ]] || die 'Неверный CPU-уровень XanMod.'
+  case "$XANMOD" in
+    main) branches=(main lts) ;;
+    lts) branches=(lts) ;;
+    *) die 'Неверная ветка ядра.' ;;
+  esac
+  for branch in "${branches[@]}"; do
+    if [[ "$branch" == main ]]; then pkg="linux-xanmod-x64v$XANMOD_LEVEL"
+    else pkg="linux-xanmod-lts-x64v$XANMOD_LEVEL"; fi
+    if ! candidate="$(apt-cache policy "$pkg" | awk '/Candidate:/ {print $2; exit}')"; then
+      die "Не удалось запросить APT для $pkg; проверьте репозитории."
+    fi
+    if [[ -z "$candidate" || "$candidate" == '(none)' ]]; then
+      say "Пакет $pkg недоступен для $CODENAME."
+    elif simulation="$(apt-get -s --no-remove install "$pkg=$candidate" 2>&1)"; then
+      if [[ "$branch" != "$XANMOD" ]]; then say 'MAIN недоступен или несовместим: автоматически выбран XanMod LTS.'; fi
+      XANMOD="$branch"; XANMOD_PACKAGE="$pkg"; XANMOD_CANDIDATE="$candidate"
+      return 0
+    else
+      say "APT не может безопасно установить $pkg=$candidate:"
+      printf '%s\n' "$simulation" >&2
+    fi
+    if [[ "$branch" == main ]]; then say 'Проверяю совместимый пакет LTS с тем же CPU-уровнем...'; fi
+  done
+  die "Нет устанавливаемого XanMod для $CODENAME/x64v$XANMOD_LEVEL. Штатное ядро сохранено; проверьте APT или выберите штатное ядро в мастере."
+}
 install_xanmod() {
   [[ "$(dpkg --print-architecture)" == amd64 ]] || die 'XanMod требует amd64.'
-  local flags flag pkg candidate tmp
+  local flags flag tmp
+  normalize_xanmod_choice
   flags="$(grep -m1 -E '^flags[[:space:]]*:' /proc/cpuinfo || true)"
   for flag in cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2; do grep -qw "$flag" <<< "$flags" || die "Нет CPU-флага $flag для v2."; done
   if [[ "$XANMOD_LEVEL" == 3 ]]; then
     for flag in avx avx2 bmi1 bmi2 f16c fma movbe xsave; do grep -qw "$flag" <<< "$flags" || die "Нет CPU-флага $flag для v3."; done
     grep -Eq '(^|[[:space:]])(lzcnt|abm)([[:space:]]|$)' <<< "$flags" || die 'Нет lzcnt/abm.'
   fi
-  case "$XANMOD" in lts) pkg="linux-xanmod-lts-x64v$XANMOD_LEVEL" ;; main) pkg="linux-xanmod-x64v$XANMOD_LEVEL" ;; *) die 'Неверная ветка ядра.' ;; esac
   install -d -m755 /etc/apt/keyrings; tmp="$(mktemp)"
   if ! wget -qO "$tmp" https://dl.xanmod.org/archive.key; then rm -f "$tmp"; die 'Не получен ключ XanMod.'; fi
   gpg --batch --yes --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg "$tmp"; rm -f "$tmp"; chmod 644 /etc/apt/keyrings/xanmod-archive-keyring.gpg
@@ -687,9 +723,11 @@ Components: main
 Signed-By: /etc/apt/keyrings/xanmod-archive-keyring.gpg
 EOF
   chmod 644 /etc/apt/sources.list.d/xanmod.sources; apt-get -o Acquire::Retries=3 update
-  candidate="$(apt-cache policy "$pkg"|awk '/Candidate:/ {print $2}')"
-  [[ -n "$candidate" && "$candidate" != '(none)' ]] || die "Нет кандидата $pkg для этого релиза."
-  say "Выбран $pkg, версия $candidate"; apt-get -s install "$pkg" >/dev/null; apt-get install -y "$pkg"
+  select_xanmod_package
+  say "Выбран $XANMOD_PACKAGE, версия $XANMOD_CANDIDATE (ветка $XANMOD)."
+  # Install exactly the simulated version. Real dpkg/install failures must stop;
+  # do not attempt another kernel after a partially completed installation.
+  apt-get install -y --no-remove "$XANMOD_PACKAGE=$XANMOD_CANDIDATE"
 }
 
 normalize_f2b_db_value() {
@@ -1474,7 +1512,7 @@ main() {
       say 'Часовой пояс не найден.'
     done
     yesno UPGRADE 'Обновить установленные пакеты' y
-    say 'Ядро: 0) штатное; 1) XanMod LTS; 2) XanMod MAIN'
+    say 'Ядро: 0) штатное; 1) XanMod LTS; 2) XanMod MAIN (при несовместимости — LTS)'
     ask choice 'Ядро' 0
     case "$choice" in 0) ;; 1) XANMOD=lts ;; 2) XANMOD=main ;; *) die 'Выберите 0/1/2.' ;; esac
     if [[ "$XANMOD" != none ]]; then ask_number XANMOD_LEVEL 'CPU x64v2/x64v3' 2 2 3; fi
@@ -1489,9 +1527,10 @@ main() {
     fi
   fi
   if [[ "$HONEYPOT" == y ]]; then
-    python3 -c 'import sys; sys.exit(sys.version_info < (3,10))' || die 'Для Cowrie нужен Python 3.10+.'
+    python3 -c 'import sys; sys.exit(sys.version_info < (3,11))' || die 'Для Cowrie нужен Python 3.11+.'
   fi
   maintenance_defaults
+  normalize_xanmod_choice
   section '5/5 — проверьте перед применением'
   printf 'SSH: %s; только ключ: %s; whitelist: %s\n' "$SSH_PORT" "$KEY_ONLY" "${WHITELIST_IP:-нет}"
   printf 'Cowrie: %s; баны: %s; суток: %s; область: %s\n' "$HONEYPOT" "$BANS" "$BAN_DAYS" "$BAN_SCOPE"
