@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# VPS Foundation 6.0.1: interactive VPS setup and maintenance for Debian/Ubuntu.
+# VPS Foundation 6.0.2: interactive VPS setup and maintenance for Debian/Ubuntu.
 set -Eeuo pipefail
 umask 077
 export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
-APP_VERSION=6.0.1
+APP_VERSION=6.0.2
 COWRIE_VERSION=3.1.2
 TX_OWNED=0
 EXTRA_PORTS=''
@@ -39,13 +39,16 @@ abort() {
 die() { abort 1 "ОШИБКА: $*"; }
 on_error() { local rc=$?; abort "$rc" "Ошибка на строке $1, код $rc, этап ${PHASE:-общий}."; }
 trap 'on_error "$LINENO"' ERR
-trap 'false' HUP INT TERM
+trap 'abort 129 "Получен SIGHUP: соединение закрыто."' HUP
+trap 'abort 130 "Операция прервана пользователем."' INT
+trap 'abort 143 "Получен SIGTERM."' TERM
 need() { command -v "$1" >/dev/null 2>&1 || die "Нет команды $1."; }
 open_tty() { if [[ -z "$TTY_FD" ]]; then if ! { exec {TTY_FD}<>/dev/tty; } 2>/dev/null; then die 'Нужен доступный /dev/tty.'; fi; fi; }
 ask() {
   local _pv="$1" _msg="$2" _def="${3-}" _ans=''
   open_tty; printf '%s' "$_msg${_def:+ [$_def]}: " >&"$TTY_FD"
-  IFS= read -r -t 180 _ans <&"$TTY_FD" || die 'Ввод прерван/таймаут 180 секунд.'
+  # Installation is interactive; do not abort while the administrator fetches a key.
+  IFS= read -r _ans <&"$TTY_FD" || die 'Ввод закрыт или прерван.'
   _ans="${_ans%$'\r'}"; printf -v "$_pv" '%s' "${_ans:-$_def}"
 }
 yesno() {
@@ -97,6 +100,9 @@ load_config() {
   if [[ -n "$WHITELIST_IP" ]]; then WHITELIST_IP="$(valid_ip "$WHITELIST_IP")"; fi
   if [[ "$KEY_ONLY" == y ]]; then check_key "$SSH_PUBLIC_KEY"; fi
   ban_defaults; maintenance_defaults
+  [[ "$BANS" == y || "$BANS" == n ]] || die 'Некорректный BANS.'
+  [[ "$BAN_SCOPE" == 1 || "$BAN_SCOPE" == 2 ]] || die 'Некорректный BAN_SCOPE.'
+  if [[ -n "$BAN_EXTRA_IP" ]]; then BAN_EXTRA_IP="$(valid_ip "$BAN_EXTRA_IP")"; fi
 }
 save_config() {
   local tmp v
@@ -124,7 +130,9 @@ ask_bans() {
 read_active() {
   [[ -f "$ACTIVE" && ! -L "$ACTIVE" ]] || return 1
   IFS= read -r ACTIVE_TX < "$ACTIVE"
-  [[ "$ACTIVE_TX" == "$STATE"/transactions/tx.* && -d "$ACTIVE_TX" ]] || die 'Повреждён путь транзакции.'
+  local name="${ACTIVE_TX##*/}"
+  [[ "$name" =~ ^tx\.[A-Za-z0-9]{8}$ && "$ACTIVE_TX" == "$STATE/transactions/$name" && -d "$ACTIVE_TX" && ! -L "$ACTIVE_TX" ]] || die 'Повреждён путь транзакции.'
+  [[ -f "$ACTIVE_TX/snapshot.sh" && ! -L "$ACTIVE_TX/snapshot.sh" && "$(stat -c '%u:%a' "$ACTIVE_TX/snapshot.sh")" == 0:600 ]] || die 'Небезопасный snapshot транзакции.'
 }
 unit_active() { systemctl is-active "$1" 2>/dev/null || true; }
 unit_enabled() { systemctl is-enabled "$1" 2>/dev/null || true; }
@@ -316,7 +324,7 @@ ssh_setup() {
   write_jail "22,$SSH_PORT${LOCAL_PORT:+,$LOCAL_PORT}"; systemctl enable fail2ban.service >/dev/null; timeout 45s systemctl restart fail2ban.service
   say "SSH на $SSH_PORT; 22 пока тоже работает. Автооткат через 15 минут."
   say "Откройте НОВОЕ подключение на $SSH_PORT и выполните: bash /root/finalize-ssh.sh"
-  TX_OWNED=0; ACTIVE_TX='' 
+  TX_OWNED=0; ACTIVE_TX=''
 }
 finalize() {
   # An invalid invocation must never own the existing transaction's rollback.
@@ -980,7 +988,12 @@ resume_ssh() {
   if [[ "$HONEYPOT" == y ]]; then write_cowrie_unit; cowrie_preflight; fi
   ASSUME_START=1; ssh_setup
 }
-section() { say ''; printf '\033[1;36m%s\033[0m\n' "$*"; }
+section() {
+  say ''
+  if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != dumb ]]; then
+    printf '\033[1;36m%s\033[0m\n' "$*"
+  else printf '%s\n' "$*"; fi
+}
 ask_number() {
   local _nv="$1" _nm="$2" _nd="$3" _min="$4" _max="$5" _n=''
   while true; do
@@ -1009,9 +1022,10 @@ ask_ip() {
   done
 }
 validate_extra_ports() {
-  python3 - "$1" <<'PY'
+  python3 - "$1" "${SSH_PORT:-}" <<'PY'
 import re,sys
 items=sys.argv[1].split()
+ssh_port=int(sys.argv[2]) if sys.argv[2] else None
 if len(items)>20:
     raise SystemExit('Не более 20 правил.')
 for item in items:
@@ -1021,6 +1035,8 @@ for item in items:
     a=int(m[1]); b=int(m[2] or m[1])
     if not 1<=a<=b<=65535 or a<=22<=b:
         raise SystemExit('Порты 1..65535; 22 управляется отдельно.')
+    if m[3]=='tcp' and ssh_port is not None and a<=ssh_port<=b:
+        raise SystemExit('Порт/диапазон TCP пересекается с настоящим SSH; он управляется отдельно.')
 PY
 }
 maintenance_defaults() {
@@ -1072,8 +1088,10 @@ PY
 }
 install_maintenance_helpers() {
   maintenance_defaults
+  local guard_tmp
   install -d -m755 "$HELPERS"
-  cat > "$HELPERS/firewall-check" <<'GUARD'
+  guard_tmp="$(mktemp "$HELPERS/.firewall-check.XXXXXXXX")"
+  cat > "$guard_tmp" <<'GUARD'
 #!/bin/bash
 set -euo pipefail
 export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -1092,7 +1110,26 @@ if Path('/proc/net/if_inet6').exists() and 'IPV6=yes' in Path('/etc/default/ufw'
     commands.append('ip6tables')
 for cmd in commands:
     chain='ufw6-before-output' if cmd=='ip6tables' else 'ufw-before-output'
-    subprocess.run([cmd,'-w','5','-C','OUTPUT','-j',chain],check=True)
+    # No earlier OUTPUT rule may bypass the UID policy. Permit only UFW's
+    # standard logging chain before its before-output hook, and verify it.
+    output=subprocess.check_output([cmd,'-w','5','-S','OUTPUT'],text=True).splitlines()
+    output=[shlex.split(r) for r in output if r.startswith('-A ')]
+    hook=['-A','OUTPUT','-j',chain]
+    logging_chain=chain.replace('-before-output','-before-logging-output')
+    allowed_logging=['-A','OUTPUT','-j',logging_chain]
+    for rule in output:
+        if rule==hook:
+            break
+        if rule!=allowed_logging:
+            raise SystemExit(cmd+': правило OUTPUT перед UFW может обходить защиту Cowrie.')
+        logrules=subprocess.check_output([cmd,'-w','5','-S',logging_chain],text=True).splitlines()
+        for line in logrules:
+            if not line.startswith('-A '): continue
+            tokens=shlex.split(line)
+            if '-j' not in tokens or tokens[tokens.index('-j')+1] not in ('LOG','NFLOG','RETURN') or '-g' in tokens:
+                raise SystemExit(cmd+': нестандартная цепочка логирования перед защитой Cowrie.')
+    else:
+        raise SystemExit(cmd+': нет безусловного перехода OUTPUT в '+chain)
     rules=subprocess.check_output([cmd,'-w','5','-S',chain],text=True).splitlines()
     rules=[shlex.split(r) for r in rules if r.startswith('-A ')]
     expected1=['-A',chain,'-m','owner','--uid-owner',uid,'-m','conntrack','--ctstate','ESTABLISHED,RELATED','-j','ACCEPT']
@@ -1113,6 +1150,15 @@ then
   exit 1
 fi
 GUARD
+  # On a running installation, verify the candidate before replacing the
+  # watchdog that the existing timer may execute at any moment.
+  if [[ "${1:-}" == --validate-firewall ]]; then
+    if ! /bin/bash "$guard_tmp"; then
+      rm -f -- "$guard_tmp"
+      die 'Новая проверка firewall не пройдена; прежние helpers и таймеры сохранены.'
+    fi
+  fi
+  chmod 755 "$guard_tmp"; mv -f -- "$guard_tmp" "$HELPERS/firewall-check"
   cat > "$HELPERS/cleanup.py" <<'PY'
 #!/usr/bin/python3
 """Runs as vps-cowrie; never walks SSH host keys or arbitrary /var/lib files."""
@@ -1227,7 +1273,7 @@ setup_maintenance() {
   local answer; ask answer 'Применить политику очистки и защиту? Введите START' ''
   [[ "$answer" == START ]] || return 0
   # Verify current UFW rules before enabling the watchdog against a working instance.
-  install_self; install_maintenance_helpers; "$HELPERS/firewall-check"
+  install_self; install_maintenance_helpers --validate-firewall; "$HELPERS/firewall-check"
   install -d -m755 /etc/systemd/system/vps-cowrie.service.d
   cat > /etc/systemd/system/vps-cowrie.service.d/20-vps-protection.conf <<EOF
 [Unit]
@@ -1241,6 +1287,30 @@ EOF
   systemctl enable --now "$GUARD_TIMER" "$CLEAN_TIMER" >/dev/null
   say 'Защитные проверки и обслуживание включены.'
 }
+show_settings() {
+  need python3; load_config
+  section 'Сохранённые настройки'
+  printf 'SSH: %s/tcp; только ключ: %s; IP администратора: %s\n' "$SSH_PORT" "$KEY_ONLY" "${WHITELIST_IP:-нет}"
+  printf 'Cowrie: %s; настройка банов: %s; суток: %s; область: %s\n' "$HONEYPOT" "$BANS" "$BAN_DAYS" "$BAN_SCOPE"
+  printf 'Порты приложений: %s\n' "${EXTRA_PORTS:-нет}"
+  printf 'Очистка: %s дней; лимит %s MiB; запас %s MiB\n' "$CLEAN_DAYS" "$CLEAN_MIB" "$MIN_FREE_MIB"
+  say 'Это сохранённые параметры. Действующие правила и службы смотрите в --status.'
+}
+show_pending() {
+  [[ -f "$ACTIVE" ]] || return 0
+  read_active || return 0
+  local stage
+  stage="$(cat "$ACTIVE_TX/stage")"
+  say "ВНИМАНИЕ: неподтверждённая смена SSH, этап: $stage."
+  case "$stage" in
+    initial) say "В новом SSH-подключении: bash $SELF --finalize" ;;
+    awaiting-confirm) say "В ещё одном новом SSH-подключении: bash $SELF --confirm $(cat "$ACTIVE_TX/confirm.token")" ;;
+    *) say 'Неизвестный этап. Используйте --rollback или консоль VPS.' ;;
+  esac
+  say "Откат: bash $SELF --rollback"
+  systemctl list-timers "$TIMER" --no-pager || true
+  ACTIVE_TX=''
+}
 show_status() {
   section "VPS Foundation $APP_VERSION — состояние"
   say "ОС: ${PRETTY_NAME:-unknown}; ядро: $(uname -r)"
@@ -1251,8 +1321,7 @@ show_status() {
     printf '%-38s %s\n' "$u" "$(unit_active "$u")"
   done
   if [[ -f "$ACTIVE" ]]; then
-    say 'ВНИМАНИЕ: SSH ещё не подтверждён. Проверьте таймер, завершите финализацию или выполните откат.'
-    systemctl list-timers "$TIMER" --no-pager || true
+    show_pending
   fi
   if command -v ufw >/dev/null; then ufw status verbose || true; fi
   if command -v ss >/dev/null; then ss -lntup || true; fi
@@ -1268,6 +1337,22 @@ check_health() {
     cowrie_listener_ok || { say 'Не пройдена проверка баннера Cowrie.'; failed=1; }
     if [[ -x "$HELPERS/firewall-check" ]]; then "$HELPERS/firewall-check" || failed=1
     else say 'Проверки firewall новой версии ещё не установлены; используйте --setup-maintenance.'; fi
+  fi
+  if [[ -f "$CONFIG" ]]; then
+    load_config
+    local service listeners
+    for service in ssh.service fail2ban.service; do
+      if ! systemctl is-active --quiet "$service"; then
+        say "Не работает обязательная служба: $service"; failed=1
+      fi
+    done
+    if command -v ss >/dev/null; then
+      listeners="$(ss -H -lntp "sport = :$SSH_PORT")"
+      if [[ "$listeners" != *sshd* ]]; then say "Нет настоящего SSH на $SSH_PORT/tcp."; failed=1; fi
+    else say 'Команда ss отсутствует: слушающий порт SSH не проверен.'; failed=1; fi
+    if [[ "$HONEYPOT" == y ]] && ! systemctl is-active --quiet vps-cowrie.service; then
+      say 'Cowrie включён в сохранённых настройках, но служба не работает.'; failed=1
+    fi
   fi
   df -h /; systemctl --failed --no-pager || true
   if ((failed)); then say 'Найдены проблемы; смотрите вывод выше.'; return 1; fi
@@ -1375,6 +1460,9 @@ main() {
     if validate_extra_ports "$EXTRA_PORTS"; then break; fi
   done
   EXTRA_PORTS="${panel}${panel:+ }$EXTRA_PORTS"
+  while ! validate_extra_ports "$EXTRA_PORTS"; do
+    ask EXTRA_PORTS 'Введите общий список портов панели и приложений заново' ''
+  done
   section '4/5 — система'
   SWAP_SIZE_GB=2; TIMEZONE=Asia/Yekaterinburg; UPGRADE=y; XANMOD=none; XANMOD_LEVEL=2
   TCP_PROFILE=balanced; BBR=y; FORWARD=n; CLEAN_DAYS=14; CLEAN_MIB=1024; MIN_FREE_MIB=512
@@ -1437,12 +1525,14 @@ menu() {
     say ' 9) Настроить очистку и контроль firewall Cowrie'
     say '10) Отключить баны Cowrie'
     say '11) Откатить неподтверждённую смену SSH'
+    say '12) Показать сохранённые настройки'
     say ' 0) Выход'
     ask choice 'Действие' 5
     case "$choice" in
       1) mode=--install ;; 2) mode=--resume-ssh ;; 3) mode=--finalize ;; 4) mode=--configure-bans ;;
       5) mode=--status ;; 6) mode=--check ;; 7) mode=--logs ;; 8) mode=--unban ;;
       9) mode=--setup-maintenance ;; 10) mode=--disable-bans ;;
+      12) mode=--settings ;;
       11) ask choice 'Вернуть прежние SSH/UFW/Fail2ban? Введите ROLLBACK' ''
           [[ "$choice" == ROLLBACK ]] || continue; mode=--rollback ;;
       0) return 0 ;; *) say 'Выберите пункт меню.'; continue ;;
@@ -1455,7 +1545,7 @@ menu() {
 usage() {
   say "VPS Foundation $APP_VERSION — Debian/Ubuntu + systemd; запуск от root"
   say 'Без аргументов: интерактивное меню. --install: мастер установки.'
-  say '--status | --check | --logs | --unban | --setup-maintenance'
+  say '--status | --settings | --check | --logs | --unban | --setup-maintenance'
   say '--configure-bans | --disable-bans | --resume-ssh'
   say '--finalize: второй этап SSH. --confirm CODE: проверка из ещё одной новой сессии.'
   say '--rollback: откат активной SSH-транзакции.'
@@ -1467,6 +1557,10 @@ case "${1:-}" in
   --version) say "VPS Foundation $APP_VERSION"; exit 0 ;;
   --help|-h) usage; exit 0 ;;
 esac
+case "${1:-}" in
+  --confirm|--rollback-bans) [[ $# == 2 && -n "${2:-}" ]] || die 'Этой команде нужен ровно один параметр.' ;;
+  *) (( $# <= 1 )) || die 'Лишние аргументы. Используйте --help.' ;;
+esac
 [[ $EUID == 0 ]] || die 'Запустите от root (sudo -i).'
 need apt-get; need systemctl
 [[ -d /run/systemd/system && -f /etc/os-release ]] || die 'Нужны Debian/Ubuntu с systemd.'
@@ -1477,6 +1571,7 @@ CODENAME="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
 case "${1:-}" in
   ''|--menu) menu; exit 0 ;;
   --status) show_status; exit 0 ;;
+  --settings) show_settings; exit 0 ;;
   --check) check_health; exit $? ;;
   --logs) show_logs; exit 0 ;;
 esac
